@@ -73,6 +73,13 @@ from cloud_panel.extensions import (
     WEBFIG_SESSION_TTL,
 )
 
+from cloud_panel.services.settings import (
+    SettingsValidationError,
+    get_settings,
+    maintenance_enabled,
+    save_settings_values,
+)
+
 from cloud_panel.utils.commands import run
 from cloud_panel.utils.network import (
     listener_uses_port as _listener_uses_port,
@@ -729,19 +736,6 @@ def audit_event(action, target="", details=""):
         pass
 
 
-def maintenance_enabled():
-    try:
-        con=db(); row=con.execute("SELECT value FROM settings WHERE key='maintenance_mode'").fetchone(); con.close()
-        return bool(row and str(row[0]) == "1")
-    except Exception:
-        return False
-
-
-def get_settings():
-    con = db()
-    rows = con.execute("SELECT key,value FROM settings").fetchall()
-    con.close()
-    return {row["key"]: row["value"] for row in rows}
 
 
 
@@ -9323,39 +9317,23 @@ def sync_log():
 @app.route("/settings", methods=["POST"])
 @login_required
 def save_settings():
-    fields = [
-        "interface", "endpoint", "port", "address", "dns", "mtu",
-        "out_interface", "system_name", "agent_interface", "agent_port",
-        "agent_address", "agent_mtu",
-    ]
-    values = {key: request.form.get(key, "").strip() for key in fields}
     try:
-        ipaddress.ip_interface(values["address"])
-        ipaddress.ip_interface(values["agent_address"])
-        port = int(values["port"])
-        agent_port = int(values["agent_port"])
-        if port < 1 or port > 65535 or agent_port < 1 or agent_port > 65535:
-            raise ValueError()
-        if not re.match(r"^[A-Za-z0-9_.-]{1,15}$", values["interface"]):
-            raise ValueError()
-        if not re.match(r"^[A-Za-z0-9_.-]{1,15}$", values["agent_interface"]):
-            raise ValueError()
-        if values["interface"] == values["agent_interface"]:
-            raise ValueError()
-        if port == agent_port:
-            raise ValueError()
-    except Exception:
-        flash("إعدادات خادمي WireGuard غير صحيحة", "danger")
+        save_settings_values(request.form)
+    except SettingsValidationError as exc:
+        flash(str(exc), "danger")
+        return redirect(url_for("wireguard_page"))
+    except Exception as exc:
+        flash("فشل حفظ الإعدادات: %s" % exc, "danger")
         return redirect(url_for("wireguard_page"))
 
-    con = db()
-    for key, value in values.items():
-        con.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (key, value))
-    con.commit()
-    con.close()
-    flash("تم حفظ إعدادات خادمي WireGuard", "success")
-    return redirect(url_for("wireguard_page") + "#server-settings")
-
+    flash(
+        "تم حفظ إعدادات خادمي WireGuard",
+        "success",
+    )
+    return redirect(
+        url_for("wireguard_page")
+        + "#server-settings"
+    )
 
 @app.route("/wireguard/apply", methods=["POST"])
 @login_required
