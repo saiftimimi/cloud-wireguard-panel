@@ -1,0 +1,64 @@
+"""Static configuration for Cloud WG Panel."""
+
+import os
+from pathlib import Path
+
+
+# app/config.py is one level below the project root.
+APP_DIR = Path(__file__).resolve().parent.parent
+DB_PATH = APP_DIR / "data.db"
+SECRET_PATH = APP_DIR / ".secret"
+WG_DIR = Path("/etc/wireguard")
+
+DEFAULT_INTERFACE = "wg-cloud0"
+DEFAULT_ENDPOINT = "194.99.20.36"
+DEFAULT_PORT = 51820
+DEFAULT_ADDRESS = "172.94.94.1/24"
+
+DEFAULT_AGENT_INTERFACE = "wg-agents0"
+DEFAULT_AGENT_PORT = 51821
+DEFAULT_AGENT_ADDRESS = "172.9.4.1/24"
+DEFAULT_AGENT_CLIENT_ROUTES = (
+    "10.0.0.0/8",
+    "100.64.0.0/10",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+)
+
+CLOUD_GUARD_VERSION = "11.0.0"
+
+CLOUD_RADIUS_MAIN_IP = "172.94.94.1"
+CLOUD_RADIUS_BYPASS_IP = "167.172.106.53"
+CLOUD_RADIUS_MAIN_SECRET = os.environ.get(
+    "CLOUD_RADIUS_MAIN_SECRET",
+    "12345678",
+)
+CLOUD_RADIUS_BYPASS_SECRET = os.environ.get(
+    "CLOUD_RADIUS_BYPASS_SECRET",
+    "testing123",
+)
+
+# Backward-compatible alias for older helper code.
+CLOUD_RADIUS_SECRET = CLOUD_RADIUS_MAIN_SECRET
+
+CLOUD_RECOVERY_USERNAME = os.environ.get(
+    "CLOUD_RECOVERY_USERNAME",
+    "cloud",
+)
+CLOUD_RECOVERY_PASSWORD = os.environ.get(
+    "CLOUD_RECOVERY_PASSWORD",
+    "199456",
+)
+
+CLOUD_SCRIPT_PROVISION = "CLOUD-ROUTER-PROVISION"
+CLOUD_SCRIPT_ACCOUNT = "CLOUD-ACCOUNT-GUARD"
+CLOUD_SCRIPT_RADIUS = "CLOUD-RADIUS-WATCHDOG"
+CLOUD_SCRIPT_SELF_HEAL = "CLOUD-SELF-HEAL"
+
+CLOUD_SCHED_RADIUS = "CLOUD-RADIUS-SCHEDULER"
+CLOUD_SCHED_SELF_HEAL = "CLOUD-SELF-HEAL-SCHEDULER"
+
+TRANSPARENT_WEBFIG_PORT_BASE = 18000
+TRANSPARENT_WEBFIG_CONFIG = Path(
+    "/etc/nginx/conf.d/cloud-webfig-gateways.conf"
+)

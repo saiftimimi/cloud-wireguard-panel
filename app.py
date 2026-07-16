@@ -34,50 +34,64 @@ from flask import (
 )
 from werkzeug.security import check_password_hash, generate_password_hash
 
-APP_DIR = Path(__file__).resolve().parent
-DB_PATH = APP_DIR / "data.db"
-SECRET_PATH = APP_DIR / ".secret"
-WG_DIR = Path("/etc/wireguard")
-
-DEFAULT_INTERFACE = "wg-cloud0"
-DEFAULT_ENDPOINT = "194.99.20.36"
-DEFAULT_PORT = 51820
-DEFAULT_ADDRESS = "172.94.94.1/24"
-DEFAULT_AGENT_INTERFACE = "wg-agents0"
-DEFAULT_AGENT_PORT = 51821
-DEFAULT_AGENT_ADDRESS = "172.9.4.1/24"
-DEFAULT_AGENT_CLIENT_ROUTES = (
-    "10.0.0.0/8",
-    "100.64.0.0/10",
-    "172.16.0.0/12",
-    "192.168.0.0/16",
+from cloud_panel.config import (
+    APP_DIR,
+    DB_PATH,
+    SECRET_PATH,
+    WG_DIR,
+    DEFAULT_INTERFACE,
+    DEFAULT_ENDPOINT,
+    DEFAULT_PORT,
+    DEFAULT_ADDRESS,
+    DEFAULT_AGENT_INTERFACE,
+    DEFAULT_AGENT_PORT,
+    DEFAULT_AGENT_ADDRESS,
+    DEFAULT_AGENT_CLIENT_ROUTES,
+    CLOUD_GUARD_VERSION,
+    CLOUD_RADIUS_MAIN_IP,
+    CLOUD_RADIUS_BYPASS_IP,
+    CLOUD_RADIUS_MAIN_SECRET,
+    CLOUD_RADIUS_BYPASS_SECRET,
+    CLOUD_RADIUS_SECRET,
+    CLOUD_RECOVERY_USERNAME,
+    CLOUD_RECOVERY_PASSWORD,
+    CLOUD_SCRIPT_PROVISION,
+    CLOUD_SCRIPT_ACCOUNT,
+    CLOUD_SCRIPT_RADIUS,
+    CLOUD_SCRIPT_SELF_HEAL,
+    CLOUD_SCHED_RADIUS,
+    CLOUD_SCHED_SELF_HEAL,
+    TRANSPARENT_WEBFIG_PORT_BASE,
+    TRANSPARENT_WEBFIG_CONFIG,
+)
+from cloud_panel.database import db
+from cloud_panel.extensions import (
+    DB_WRITE_LOCK,
+    ROUTER_GUARD_LOCK,
+    WEBFIG_SESSION_LOCK,
+    WEBFIG_SESSIONS,
+    WEBFIG_SESSION_TTL,
 )
 
-CLOUD_GUARD_VERSION = "11.0.0"
-CLOUD_RADIUS_MAIN_IP = "172.94.94.1"
-CLOUD_RADIUS_BYPASS_IP = "167.172.106.53"
-CLOUD_RADIUS_MAIN_SECRET = os.environ.get("CLOUD_RADIUS_MAIN_SECRET", "12345678")
-CLOUD_RADIUS_BYPASS_SECRET = os.environ.get("CLOUD_RADIUS_BYPASS_SECRET", "testing123")
-# Backward-compatible alias for older helper code.
-CLOUD_RADIUS_SECRET = CLOUD_RADIUS_MAIN_SECRET
-CLOUD_RECOVERY_USERNAME = os.environ.get("CLOUD_RECOVERY_USERNAME", "cloud")
-CLOUD_RECOVERY_PASSWORD = os.environ.get("CLOUD_RECOVERY_PASSWORD", "199456")
-CLOUD_SCRIPT_PROVISION = "CLOUD-ROUTER-PROVISION"
-CLOUD_SCRIPT_ACCOUNT = "CLOUD-ACCOUNT-GUARD"
-CLOUD_SCRIPT_RADIUS = "CLOUD-RADIUS-WATCHDOG"
-CLOUD_SCRIPT_SELF_HEAL = "CLOUD-SELF-HEAL"
-CLOUD_SCHED_RADIUS = "CLOUD-RADIUS-SCHEDULER"
-CLOUD_SCHED_SELF_HEAL = "CLOUD-SELF-HEAL-SCHEDULER"
-ROUTER_GUARD_LOCK = threading.RLock()
+from cloud_panel.utils.commands import run
+from cloud_panel.utils.network import (
+    listener_uses_port as _listener_uses_port,
+    next_external_port,
+    normalize_internal_ip,
+    tcp_listener_uses_port,
+    validate_external_port,
+    validate_forward_protocol,
+)
+
+from cloud_panel.utils.crypto import (
+    APP_SECRET,
+    cipher,
+    decrypt_text,
+    encrypt_text,
+)
 
 app = Flask(__name__)
 
-if SECRET_PATH.exists():
-    APP_SECRET = SECRET_PATH.read_text().strip()
-else:
-    APP_SECRET = secrets.token_hex(32)
-    SECRET_PATH.write_text(APP_SECRET)
-    os.chmod(str(SECRET_PATH), 0o600)
 
 app.secret_key = APP_SECRET
 app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024
@@ -85,16 +99,6 @@ app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 
 
-DB_WRITE_LOCK = threading.RLock()
-
-WEBFIG_SESSION_LOCK = threading.RLock()
-WEBFIG_SESSIONS = {}
-WEBFIG_SESSION_TTL = 900
-
-TRANSPARENT_WEBFIG_PORT_BASE = 18000
-TRANSPARENT_WEBFIG_CONFIG = Path(
-    "/etc/nginx/conf.d/cloud-webfig-gateways.conf"
-)
 
 
 def transparent_webfig_port(peer_id):
@@ -337,17 +341,6 @@ def agent_webfig_transparent(peer_id):
 
 
 
-
-def db():
-    con = sqlite3.connect(
-        str(DB_PATH),
-        timeout=60,
-        check_same_thread=False,
-    )
-    con.row_factory = sqlite3.Row
-    con.execute("PRAGMA busy_timeout=60000")
-    con.execute("PRAGMA foreign_keys=ON")
-    return con
 
 
 def has_column(con, table, column):
@@ -750,130 +743,6 @@ def get_settings():
     con.close()
     return {row["key"]: row["value"] for row in rows}
 
-
-def run(cmd, input_text=None, check=True):
-    proc = subprocess.run(
-        cmd,
-        input=input_text.encode() if input_text else None,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE
-    )
-    if check and proc.returncode != 0:
-        raise RuntimeError(proc.stderr.decode(errors="ignore").strip() or "Command failed")
-    return proc.stdout.decode(errors="ignore").strip()
-
-
-def cipher():
-    raw = hashlib.sha256(APP_SECRET.encode()).digest()
-    return Fernet(base64.urlsafe_b64encode(raw))
-
-
-def encrypt_text(value):
-    if not value:
-        return ""
-    return cipher().encrypt(value.encode()).decode()
-
-
-def decrypt_text(value):
-    if not value:
-        return ""
-    try:
-        return cipher().decrypt(value.encode()).decode()
-    except InvalidToken:
-        return ""
-
-
-
-def tcp_listener_uses_port(port):
-    proc = subprocess.run(
-        ["ss", "-lntH"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE
-    )
-    if proc.returncode != 0:
-        return False
-    suffix = ":%d" % int(port)
-    for line in proc.stdout.decode(errors="ignore").splitlines():
-        parts = line.split()
-        if len(parts) >= 4 and parts[3].endswith(suffix):
-            return True
-    return False
-
-
-def next_external_port(start=10001, end=19999):
-    con = db()
-    used = {
-        int(row["winbox_external"])
-        for row in con.execute(
-            "SELECT winbox_external FROM peers WHERE winbox_external > 0"
-        ).fetchall()
-    }
-    con.close()
-
-    for port in range(start, end + 1):
-        if port not in used and not tcp_listener_uses_port(port):
-            return port
-    raise RuntimeError("لا يوجد بورت WinBox خارجي فارغ")
-
-
-def validate_external_port(port, peer_id=None):
-    port = int(port)
-    if port < 1 or port > 65535:
-        raise RuntimeError("البورت الخارجي غير صحيح")
-
-    con = db()
-    if peer_id is None:
-        row = con.execute(
-            "SELECT name FROM peers WHERE winbox_external=? LIMIT 1",
-            (port,)
-        ).fetchone()
-    else:
-        row = con.execute(
-            "SELECT name FROM peers WHERE winbox_external=? AND id<>? LIMIT 1",
-            (port, int(peer_id))
-        ).fetchone()
-    con.close()
-
-    if row:
-        raise RuntimeError("البورت مستخدم من الوكيل: %s" % row["name"])
-    if tcp_listener_uses_port(port):
-        raise RuntimeError("البورت مستخدم من خدمة أخرى على Ubuntu")
-    return True
-
-
-
-def _listener_uses_port(port, protocol):
-    protocol = protocol.lower()
-    command = ["ss", "-lntH"] if protocol == "tcp" else ["ss", "-lnuH"]
-    proc = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    if proc.returncode != 0:
-        return False
-
-    suffix = ":%d" % int(port)
-    for line in proc.stdout.decode(errors="ignore").splitlines():
-        parts = line.split()
-        if len(parts) >= 4 and parts[3].endswith(suffix):
-            return True
-    return False
-
-
-def validate_forward_protocol(value):
-    value = (value or "tcp").strip().lower()
-    if value not in ("tcp", "udp", "both"):
-        raise RuntimeError("البروتوكول يجب أن يكون TCP أو UDP أو الاثنين")
-    return value
-
-
-def normalize_internal_ip(value):
-    try:
-        address = ipaddress.ip_address((value or "").strip())
-    except Exception:
-        raise RuntimeError("IP المشترك الداخلي غير صحيح")
-    if address.version != 4:
-        raise RuntimeError("حالياً التحويل يدعم IPv4 فقط")
-    if address.is_unspecified or address.is_multicast or address.is_loopback:
-        raise RuntimeError("IP المشترك الداخلي غير مسموح")
-    return str(address)
 
 
 

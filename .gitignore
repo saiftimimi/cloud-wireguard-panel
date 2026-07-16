@@ -19,3 +19,12 @@ data.db.before*
 static.before*
 templates.before*
 
+
+# Cloud WG Panel runtime files
+data.db-*
+*.db-journal
+*.db-wal
+*.db-shm
+*.py[cod]
+logs/
+/tmp/
