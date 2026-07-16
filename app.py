@@ -73,6 +73,12 @@ from cloud_panel.extensions import (
     WEBFIG_SESSION_TTL,
 )
 
+from cloud_panel.services.auth import (
+    authenticate_admin,
+    authenticate_agent,
+    record_agent_login,
+)
+
 from cloud_panel.services.settings import (
     SettingsValidationError,
     get_settings,
@@ -8727,14 +8733,12 @@ def login():
         password = request.form.get("password", "")
 
         # Try administrator accounts first.
-        con = db()
-        user = con.execute(
-            "SELECT * FROM users WHERE username=?",
-            (username,),
-        ).fetchone()
-        con.close()
+        user = authenticate_admin(
+            username,
+            password,
+        )
 
-        if user and check_password_hash(user["password_hash"], password):
+        if user:
             session.clear()
             session["user_id"] = int(user["id"])
             session["username"] = user["username"]
@@ -8748,18 +8752,12 @@ def login():
             return redirect(url_for("dashboard"))
 
         # Same form also accepts agent accounts.
-        con = db()
-        account = con.execute(
-            "SELECT * FROM agent_accounts WHERE username=?",
-            (username,),
-        ).fetchone()
-        con.close()
+        account = authenticate_agent(
+            username,
+            password,
+        )
 
-        if (
-            account
-            and account["enabled"]
-            and check_password_hash(account["password_hash"], password)
-        ):
+        if account:
             session.clear()
             session["agent_account_id"] = int(account["id"])
             session["agent_username"] = account["username"]
@@ -8782,16 +8780,9 @@ def login():
                 agent_account_id=account["id"],
             )
 
-            con = db()
-            con.execute(
-                "UPDATE agent_accounts SET last_login_at=? WHERE id=?",
-                (
-                    datetime.now().isoformat(timespec="seconds"),
-                    int(account["id"]),
-                ),
+            record_agent_login(
+                account["id"]
             )
-            con.commit()
-            con.close()
             return redirect(url_for("agent_dashboard"))
 
         flash("اسم المستخدم أو كلمة المرور غير صحيحة", "danger")
