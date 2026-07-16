@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% set heading = "فحص الاتصال" %}
+{% set subheading = peer.name %}
+{% block content %}
+<div class="stats-grid three">
+  <article class="stat blue"><div><span>الحالة</span><strong>{{ 'Online' if result.online else 'Offline' }}</strong></div></article>
+  <article class="stat teal"><div><span>Ping</span><strong>{{ result.latency }}</strong></div></article>
+  <article class="stat orange"><div><span>Packet Loss</span><strong>{{ result.loss }}</strong></div></article>
+</div>
+<section class="panel"><pre>{{ result.output }}</pre><a class="btn" href="{{ url_for('wireguard_page') }}">رجوع</a></section>
+{% endblock %}

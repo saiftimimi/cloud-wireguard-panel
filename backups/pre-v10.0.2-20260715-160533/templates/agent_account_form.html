@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% set heading = "تعديل الوكيل" if account else "إضافة وكيل" %}
+{% set subheading = "بيانات الحساب والراوترات المسموحة" %}
+{% block content %}
+<form method="post" class="agent-account-form" id="agentAccountForm">
+  <section class="panel">
+    <div class="panel-head"><div><h2>بيانات الدخول</h2><p>اسم المستخدم إنكليزي، وكلمة المرور 8 أحرف على الأقل.</p></div></div>
+    <div class="form-grid">
+      <div><label>الاسم الظاهر</label><input name="display_name" value="{{ account.display_name if account else '' }}" placeholder="مثلاً: وكيل النجف" required></div>
+      <div><label>اسم المستخدم</label><input name="username" dir="ltr" value="{{ account.username if account else '' }}" placeholder="najaf.agent" required></div>
+      <div><label>{{ 'كلمة مرور جديدة (اتركها فارغة بدون تغيير)' if account else 'كلمة المرور' }}</label><input type="password" name="password" minlength="8" {{ '' if account else 'required' }} autocomplete="new-password"></div>
+      <label class="permission-option account-enable-option"><input type="checkbox" name="enabled" {{ 'checked' if not account or account.enabled else '' }}><span><b>الحساب فعال</b><small>إلغاء التحديد يمنع تسجيل الدخول.</small></span></label>
+    </div>
+  </section>
+  <section class="panel">
+    <div class="panel-head"><div><h2>الراوترات المسموحة</h2><p>الوكيل يشوف الراوترات المحددة فقط.</p></div><button class="btn mini" type="button" id="toggleAllRouters">تحديد الكل</button></div>
+    <div class="router-assignment-grid">
+    {% for peer in peers %}<label class="router-assignment-option"><input type="checkbox" name="peer_ids" value="{{ peer.id }}" {{ 'checked' if peer.id in selected_peer_ids else '' }}><span class="assignment-state {{ 'online-mark' if peer.enabled else 'offline-mark' }}"></span><span><b>{{ peer.name }}</b><small dir="ltr">{{ peer.tunnel_ip }}</small></span></label>{% else %}<div class="empty">أضف الراوترات أولاً</div>{% endfor %}
+    </div>
+  </section>
+  {% if account %}<section class="panel slim-panel"><div class="panel-head"><div><h2>صلاحيات الوكيل</h2><p>الصلاحيات منفصلة عن بيانات الحساب.</p></div><a class="btn primary" href="{{ url_for('permission_edit', account_id=account.id) }}">فتح الصلاحيات</a></div></section>{% endif %}
+  <div class="sticky-form-actions"><a class="btn" href="{{ url_for('agent_accounts_page') }}">إلغاء</a><button class="btn primary">{{ 'حفظ التعديلات' if account else 'إنشاء الوكيل' }}</button></div>
+</form>
+<script>(function(){const checks=Array.from(document.querySelectorAll('input[name="peer_ids"]'));const btn=document.getElementById('toggleAllRouters');if(btn){btn.addEventListener('click',function(){const v=checks.some(function(x){return !x.checked});checks.forEach(function(x){x.checked=v})})}})();</script>
+{% endblock %}

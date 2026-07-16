@@ -1,0 +1,61 @@
+{% extends "agent_base.html" %}
+{% set heading = "مرحباً " ~ (agent_account.display_name or agent_account.username) %}
+{% set subheading = "هنا تظهر فقط الراوترات المخصصة لحسابك" %}
+{% block content %}
+<div class="stats-grid three agent-portal-stats">
+  <article class="stat purple"><div class="stat-icon">R</div><div><span>الراوترات</span><strong>{{ total }}</strong></div></article>
+  <article class="stat blue"><div class="stat-icon">●</div><div><span>المتصلة</span><strong id="agentOnlineCount">{{ online }}</strong></div></article>
+  <article class="stat red"><div class="stat-icon">!</div><div><span>الأوفلاين</span><strong id="agentOfflineCount">{{ offline }}</strong></div></article>
+</div>
+<section class="panel">
+  <div class="panel-head"><div><h2>راوتراتي</h2><p>الراوترات مرتبة عمودياً، والأوفلاين يظهر أولاً.</p></div><span class="background-refresh"><i></i> تحديث خفيف بالخلفية</span></div>
+  {% if not agent_account.can_view_routers %}
+    <div class="empty">مدير النظام موقف صلاحية مشاهدة الراوترات لهذا الحساب.</div>
+  {% else %}
+  <div class="agent-portal-router-list" id="agentRouterList">
+  {% for peer in peers %}
+    <article id="agent-router-{{ peer.id }}" class="agent-portal-router-card vertical-router-card {{ 'is-online' if peer.wg.online else 'is-offline' }}" data-router-id="{{ peer.id }}">
+      <div class="portal-router-head">
+        <div><h3>{{ peer.name }}</h3><p dir="ltr">{{ peer.tunnel_ip }}</p></div>
+        {% if agent_account.can_view_router_status %}<span class="status router-live-status {{ 'on' if peer.wg.online else 'off' }}">{{ 'متصل' if peer.wg.online else 'أوفلاين' }}</span>{% endif %}
+      </div>
+      {% if agent_account.can_view_notes and peer.notes %}<div class="router-note-preview">{{ peer.notes }}</div>{% endif %}
+      <div class="portal-router-stats vertical-router-stats">
+        {% if agent_account.can_view_handshake %}<div><span>آخر اتصال</span><b class="router-handshake">{{ peer.wg.handshake_text }}</b></div>{% endif %}
+        {% if agent_account.can_view_subscribers %}<div><span>اليوزرات</span><b>{{ peer.subscriber_count }}</b></div>{% endif %}
+        {% if agent_account.can_view_traffic %}<div><span>RX</span><b class="download router-rx">{{ peer.wg.rx|human_bytes }}</b></div><div><span>TX</span><b class="upload router-tx">{{ peer.wg.tx|human_bytes }}</b></div>{% endif %}
+        {% if agent_account.can_view_ping %}<div><span>Ping</span><b class="router-latency">{{ peer.ping.latency }}</b></div><div><span>Loss</span><b class="router-loss">{{ peer.ping.loss }}</b></div>{% endif %}
+      </div>
+      <a class="btn agent-access wide" href="{{ url_for('agent_router_page', peer_id=peer.id) }}">فتح الراوتر واليوزرات</a>
+    </article>
+  {% else %}<div class="empty">ماكو راوتر معين لهذا الحساب. راجع مدير النظام.</div>{% endfor %}
+  </div>
+  {% endif %}
+</section>
+{% if agent_account.can_change_password and not agent_account.read_only %}
+<section class="panel password-panel"><div><h2>تغيير كلمة المرور</h2><p>غيّر كلمة مرور حساب الوكيل.</p></div><form method="post" action="{{ url_for('agent_change_password') }}" class="inline-fields"><input type="password" name="current_password" placeholder="الحالية" required><input type="password" name="new_password" minlength="8" placeholder="الجديدة" required><button class="btn primary">حفظ</button></form></section>
+{% endif %}
+<script>
+(function(){
+  const endpoint={{ url_for('agent_dashboard_status_api')|tojson }};
+  async function refresh(){
+    try{
+      const response=await fetch(endpoint,{headers:{'X-Requested-With':'fetch'},cache:'no-store'});
+      if(!response.ok)return;
+      const data=await response.json();
+      let online=0;
+      data.routers.forEach(function(item){
+        const card=document.getElementById('agent-router-'+item.id);if(!card)return;
+        const status=card.querySelector('.router-live-status');
+        if(item.online!==null){online+=item.online?1:0;card.classList.toggle('is-online',item.online);card.classList.toggle('is-offline',!item.online);if(status){status.classList.toggle('on',item.online);status.classList.toggle('off',!item.online);status.textContent=item.online?'متصل':'أوفلاين'}}
+        const map={'.router-handshake':item.handshake,'.router-rx':item.rx,'.router-tx':item.tx,'.router-latency':item.latency,'.router-loss':item.loss};
+        Object.keys(map).forEach(function(selector){const node=card.querySelector(selector);if(node&&map[selector]!==undefined&&map[selector]!==null&&map[selector]!=='')node.textContent=map[selector]});
+      });
+      const total=data.routers.length;const onlineNode=document.getElementById('agentOnlineCount'),offlineNode=document.getElementById('agentOfflineCount');if(onlineNode)onlineNode.textContent=online;if(offlineNode)offlineNode.textContent=Math.max(0,total-online);
+      const list=document.getElementById('agentRouterList');if(list){Array.from(list.children).sort(function(a,b){return (a.classList.contains('is-online')?1:0)-(b.classList.contains('is-online')?1:0)}).forEach(function(node){list.appendChild(node)})}
+    }catch(error){}
+  }
+  setInterval(refresh,20000);
+})();
+</script>
+{% endblock %}

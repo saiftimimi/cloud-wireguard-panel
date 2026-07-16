@@ -1,0 +1,21 @@
+{% extends "agent_base.html" %}
+{% set heading = "الصلاحيات" %}
+{% set subheading = "الصلاحيات الممنوحة لحسابك" %}
+{% block content %}
+<div class="permission-groups">
+{% for group_title, permissions in permission_groups %}
+<section class="panel permission-group-card">
+  <div class="panel-head"><div><h2>{{ group_title }}</h2><p>عرض فقط — التعديل يتم من حساب الإدارة.</p></div></div>
+  <div class="permission-list">
+  {% for field, label, description in permissions %}
+    <div class="permission-row {{ 'permission-enabled' if agent_account[field] else 'permission-disabled' }}">
+      <span class="permission-state">{{ '✓' if agent_account[field] else '×' }}</span>
+      <div><b>{{ label }}</b><small>{{ description }}</small></div>
+      <span class="status {{ 'on' if agent_account[field] else 'off' }}">{{ 'مسموح' if agent_account[field] else 'غير مسموح' }}</span>
+    </div>
+  {% endfor %}
+  </div>
+</section>
+{% endfor %}
+</div>
+{% endblock %}

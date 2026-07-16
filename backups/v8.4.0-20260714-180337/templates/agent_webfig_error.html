@@ -1,0 +1,14 @@
+{% extends "agent_base.html" %}
+{% set heading = "تعذر فتح WebFig" %}
+{% set subheading = peer.name %}
+{% block content %}
+<section class="panel webfig-error-card">
+  <div class="webfig-error-icon">!</div>
+  <h2>تعذر الاتصال بـWebFig</h2>
+  <p>{{ error }}</p>
+  <div class="action-row">
+    <a class="btn primary" href="{{ url_for('agent_webfig_gateway', peer_id=peer.id, proxy_path='', _reconnect=1) }}">إعادة المحاولة والتهيئة</a>
+    <a class="btn" href="{{ url_for('agent_router_page', peer_id=peer.id) }}">رجوع للراوتر</a>
+  </div>
+</section>
+{% endblock %}

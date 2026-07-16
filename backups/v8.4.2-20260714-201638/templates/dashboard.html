@@ -1,0 +1,138 @@
+{% extends "base.html" %}
+{% set heading = "لوحة التحكم" %}
+{% set subheading = "حالة الراوترات والوكلاء بشكل مباشر" %}
+{% block content %}
+
+<div class="stats-grid dashboard-stats">
+  <article class="stat purple">
+    <div class="stat-icon">R</div>
+    <div><span>إجمالي الراوترات</span><strong>{{ total }}</strong></div>
+  </article>
+
+  <article class="stat blue">
+    <div class="stat-icon">●</div>
+    <div><span>الراوترات المتصلة</span><strong>{{ online }}</strong></div>
+  </article>
+
+  <article class="stat red">
+    <div class="stat-icon">!</div>
+    <div><span>الراوترات الأوفلاين</span><strong>{{ offline }}</strong></div>
+  </article>
+
+  <article class="stat teal">
+    <div class="stat-icon">⇩</div>
+    <div><span>إجمالي التنزيل</span><strong>{{ rx|human_bytes }}</strong></div>
+  </article>
+
+  <article class="stat orange">
+    <div class="stat-icon">⇧</div>
+    <div><span>إجمالي الرفع</span><strong>{{ tx|human_bytes }}</strong></div>
+  </article>
+</div>
+
+<section class="panel offline-overview {{ 'has-offline' if offline else 'all-online' }}">
+  <div class="panel-head">
+    <div>
+      <h2>الراوترات الأوفلاين</h2>
+      <p>تظهر هنا مباشرة حتى تنتبه لأي راوتر انقطع</p>
+    </div>
+    <span class="offline-count-badge">{{ offline }}</span>
+  </div>
+
+  {% if offline_peers %}
+    <div class="offline-router-grid">
+    {% for p in offline_peers %}
+      <article class="offline-router-card">
+        <div class="offline-router-head">
+          <div>
+            <b>{{ p.name }}</b>
+            <small dir="ltr">{{ p.tunnel_ip }}</small>
+          </div>
+          <span class="status off">أوفلاين</span>
+        </div>
+
+        <div class="offline-router-meta">
+          <span>آخر Handshake</span>
+          <b>{{ p.wg.handshake_text or '-' }}</b>
+        </div>
+
+        <div class="offline-router-actions">
+          <a class="btn mini primary" href="{{ url_for('edit_peer', peer_id=p.id) }}">فحص الإعدادات</a>
+          <a class="btn mini blue" href="{{ url_for('peer_scripts', peer_id=p.id) }}">سكربت الراوتر</a>
+        </div>
+      </article>
+    {% endfor %}
+    </div>
+  {% else %}
+    <div class="all-online-message">
+      <span>✓</span>
+      <div>
+        <b>كل الراوترات متصلة</b>
+        <small>ماكو أي راوتر أوفلاين حالياً</small>
+      </div>
+    </div>
+  {% endif %}
+</section>
+
+<div class="dashboard-grid">
+  <section class="panel main-panel">
+    <div class="panel-head">
+      <div>
+        <h2>حالة جميع الراوترات</h2>
+        <p>الأوفلاين يظهر أولاً، وبعده الراوترات المتصلة</p>
+      </div>
+      <a class="btn primary" href="{{ url_for('routers_page') }}">عرض الراوترات</a>
+    </div>
+
+    <div class="dashboard-router-list">
+      {% for p in peers %}
+      <article class="dashboard-router-row {{ 'is-online' if p.wg.online else 'is-offline' }}">
+        <div class="dashboard-router-main">
+          <span class="router-state-icon">{{ '✓' if p.wg.online else '!' }}</span>
+          <div>
+            <b>{{ p.name }}</b>
+            <small dir="ltr">{{ p.tunnel_ip }}</small>
+          </div>
+        </div>
+
+        <div class="dashboard-router-data">
+          <div><span>الحالة</span><b class="{{ 'good-text' if p.wg.online else 'danger-text' }}">{{ 'متصل' if p.wg.online else 'أوفلاين' }}</b></div>
+          <div><span>آخر اتصال</span><b>{{ p.wg.handshake_text or '-' }}</b></div>
+          <div><span>RX</span><b class="download">{{ p.wg.rx|human_bytes }}</b></div>
+          <div><span>TX</span><b class="upload">{{ p.wg.tx|human_bytes }}</b></div>
+        </div>
+
+        <a class="dashboard-router-open" href="{{ url_for('router_manage', peer_id=p.id) }}">فتح</a>
+      </article>
+      {% else %}
+      <div class="empty">لا توجد راوترات</div>
+      {% endfor %}
+    </div>
+  </section>
+
+  <aside class="panel server-card">
+    <div class="panel-head">
+      <h2>حالة السيرفر</h2>
+      <span class="healthy">سليم</span>
+    </div>
+    <div class="server-row"><span>العنوان العام</span><b dir="ltr">{{ settings.endpoint }}</b></div>
+    <div class="server-row"><span>WireGuard الراوترات</span><b dir="ltr">{{ settings.port }}/UDP</b></div>
+    <div class="server-row"><span>WireGuard الوكلاء</span><b dir="ltr">{{ settings.agent_port }}/UDP</b></div>
+    <div class="server-row"><span>IP شبكة الوكلاء</span><b dir="ltr">{{ settings.agent_address }}</b></div>
+    <div class="server-row"><span>المتصلون</span><b>{{ online }} / {{ total }}</b></div>
+    <div class="pulse"><span></span></div>
+  </aside>
+</div>
+
+<section class="panel password-panel">
+  <div>
+    <h2>تغيير كلمة المرور</h2>
+    <p>غيّر كلمة مرور حساب الإدارة</p>
+  </div>
+  <form method="post" action="{{ url_for('change_password') }}" class="inline-fields">
+    <input type="password" name="current_password" placeholder="الحالية" required>
+    <input type="password" name="new_password" minlength="8" placeholder="الجديدة" required>
+    <button class="btn primary">حفظ</button>
+  </form>
+</section>
+{% endblock %}

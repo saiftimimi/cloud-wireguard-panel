@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% set heading = "الملف الشخصي" %}
+{% set subheading = "إدارة بيانات حسابك ومعلومات الدخول" %}
+{% block content %}
+<section class="panel profile-page-card">
+  <div class="profile-page-head">
+    <div class="profile-avatar-large">{{ (profile.display_name or profile.username)[0]|upper }}</div>
+    <div>
+      <h2>{{ profile.display_name or profile.username }}</h2>
+      <p>{{ 'حساب وكيل' if is_agent else 'حساب الإدارة' }}</p>
+    </div>
+  </div>
+
+  <form method="post" class="profile-form" autocomplete="off">
+    <div class="profile-section">
+      <div class="profile-section-title"><h3>المعلومات الأساسية</h3><p>المعلومات التي تظهر داخل اللوحة والسجلات.</p></div>
+      <div class="profile-fields-grid">
+        <label>الاسم الظاهر<input name="display_name" value="{{ profile.display_name or '' }}" maxlength="80" placeholder="الاسم الظاهر داخل النظام"></label>
+        <label>اسم المستخدم<input name="username" value="{{ profile.username }}" maxlength="80" required autocomplete="username" dir="ltr"></label>
+        <label>رقم الهاتف<input name="phone" value="{{ profile.phone or '' }}" maxlength="40" inputmode="tel" placeholder="07xxxxxxxxx" dir="ltr"></label>
+        <label>البريد الإلكتروني<input type="email" name="email" value="{{ profile.email or '' }}" maxlength="160" placeholder="name@example.com" dir="ltr"></label>
+      </div>
+    </div>
+
+    <div class="profile-section">
+      <div class="profile-section-title"><h3>بيانات الدخول</h3><p>اترك كلمة المرور الجديدة فارغة إذا ما تريد تغييرها.</p></div>
+      <div class="profile-fields-grid">
+        <label>كلمة المرور الحالية<input type="password" name="current_password" autocomplete="current-password" placeholder="مطلوبة عند تغيير اليوزر أو الباسورد"></label>
+        <label>كلمة المرور الجديدة<input type="password" name="new_password" minlength="8" autocomplete="new-password" placeholder="8 أحرف على الأقل"></label>
+      </div>
+    </div>
+
+    <div class="profile-actions">
+      <button class="btn primary" type="submit">حفظ التعديلات</button>
+      <a class="btn" href="{{ url_for('agent_dashboard' if is_agent else 'dashboard') }}">رجوع</a>
+    </div>
+  </form>
+</section>
+{% endblock %}

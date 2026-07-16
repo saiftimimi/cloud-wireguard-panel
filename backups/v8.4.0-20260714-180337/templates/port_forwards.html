@@ -1,0 +1,201 @@
+{% extends "base.html" %}
+{% set heading = "تحويلات المشتركين" %}
+{% set subheading = "المشتركون والتحويلات لكل راوتر" %}
+{% block content %}
+
+<section class="panel router-list-head">
+  <div class="panel-head">
+    <div>
+      <h2>الراوترات</h2>
+    </div>
+
+    <div class="router-status-summary">
+      <span class="summary-chip all">{{ router_cards|length }} الكل</span>
+      <span class="summary-chip online">{{ online_count }} متصل</span>
+      <span class="summary-chip offline">{{ offline_count }} أوفلاين</span>
+    </div>
+  </div>
+</section>
+
+<div class="list-toolbar router-filter-toolbar">
+  <div class="filter-buttons">
+    <button type="button" class="router-filter-btn active" data-filter="all">الكل</button>
+    <button type="button" class="router-filter-btn" data-filter="online">المتصل</button>
+    <button type="button" class="router-filter-btn" data-filter="offline">الأوفلاين</button>
+  </div>
+  <span class="auto-update-note">تحديث تلقائي كل 20 ثانية</span>
+</div>
+
+<div class="router-card-grid" id="routerCardGrid">
+{% for router in router_cards %}
+  <article
+    class="router-only-card {{ 'router-online' if router.wg_online else 'router-offline' }}"
+    data-status="{{ 'online' if router.wg_online else 'offline' }}"
+  >
+    <div class="router-card-top">
+      <div class="router-card-identity">
+        <span class="router-card-icon">R</span>
+        <div>
+          <h3>{{ router.name }}</h3>
+          <p dir="ltr">{{ router.tunnel_ip }}</p>
+        </div>
+      </div>
+
+      <div class="router-top-actions">
+        <div class="router-winbox-copy">
+          <span>WinBox</span>
+          <b dir="ltr">{{ settings.endpoint }}:{{ router.winbox_external }}</b>
+          <button
+            type="button"
+            class="copy-inline-btn"
+            data-copy-value="{{ settings.endpoint }}:{{ router.winbox_external }}"
+          >نسخ</button>
+        </div>
+
+        <span class="status {{ 'on' if router.wg_online else 'off' }}">
+          {{ 'متصل' if router.wg_online else 'غير متصل' }}
+        </span>
+      </div>
+    </div>
+
+    <div class="router-card-stats">
+      <div>
+        <span>اليوزرات</span>
+        <b>{{ router.subscriber_count }}</b>
+      </div>
+
+      <div>
+        <span>التحويلات الفعالة</span>
+        <b>{{ router.active_forward_count }}</b>
+      </div>
+
+      <div>
+        <span>API</span>
+        <b class="{{ 'good-text' if router.api_ready else 'muted-text' }}">
+          {{ 'جاهز' if router.api_ready else 'بانتظار الربط' }}
+        </b>
+      </div>
+    </div>
+
+    <div class="router-card-details">
+      <div>
+        <span>آخر Handshake</span>
+        <b>{{ router.handshake_text or '-' }}</b>
+      </div>
+
+      <div>
+        <span>آخر ظهور يوزر</span>
+        <b>{{ router.last_subscriber_seen or '-' }}</b>
+      </div>
+    </div>
+
+    <div class="router-card-buttons">
+      <a
+        class="btn primary wide router-open-button"
+        href="{{ url_for('router_subscribers_page', peer_id=router.id) }}"
+      >
+        فتح صفحة الراوتر
+      </a>
+
+      <a
+        class="btn agent-access wide"
+        href="{{ url_for('peer_agent_access', peer_id=router.id) }}"
+      >
+        باركود الموبايل / كونفك Windows
+      </a>
+    </div>
+  </article>
+{% else %}
+  <section class="panel">
+    <div class="empty">لا توجد راوترات مضافة</div>
+  </section>
+{% endfor %}
+</div>
+
+<div id="copy-toast" class="copy-toast">تم النسخ</div>
+
+<script>
+(function () {
+  const toast = document.getElementById("copy-toast");
+  let timer = null;
+
+  async function copyValue(value) {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(value);
+      return;
+    }
+    const area = document.createElement("textarea");
+    area.value = value;
+    area.style.position = "fixed";
+    area.style.opacity = "0";
+    document.body.appendChild(area);
+    area.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(area);
+    if (!ok) throw new Error("copy failed");
+  }
+
+  document.querySelectorAll("[data-copy-value]").forEach(function (button) {
+    button.addEventListener("click", async function () {
+      const value = button.getAttribute("data-copy-value");
+      try {
+        await copyValue(value);
+        toast.textContent = "تم نسخ: " + value;
+      } catch (error) {
+        toast.textContent = "تعذر النسخ";
+      }
+      toast.classList.add("show");
+      clearTimeout(timer);
+      timer = setTimeout(function () {
+        toast.classList.remove("show");
+      }, 1600);
+    });
+  });
+})();
+</script>
+
+
+<script>
+(function () {
+  const cards = Array.from(document.querySelectorAll(".router-only-card"));
+  const buttons = Array.from(document.querySelectorAll(".router-filter-btn"));
+
+  buttons.forEach(function (button) {
+    button.addEventListener("click", function () {
+      const filter = button.dataset.filter;
+      buttons.forEach(function (item) { item.classList.remove("active"); });
+      button.classList.add("active");
+
+      cards.forEach(function (card) {
+        const show = filter === "all" || card.dataset.status === filter;
+        card.classList.toggle("hidden", !show);
+      });
+    });
+  });
+})();
+</script>
+
+<script>
+(function () {
+  const refreshMs = 20000;
+  let timer = null;
+
+  function schedule() {
+    clearTimeout(timer);
+    timer = setTimeout(function () {
+      if (!document.hidden) {
+        window.location.reload();
+      } else {
+        schedule();
+      }
+    }, refreshMs);
+  }
+
+  document.addEventListener("visibilitychange", function () {
+    if (!document.hidden) schedule();
+  });
+
+  schedule();
+})();
+</script>
+{% endblock %}

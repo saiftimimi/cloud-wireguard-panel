@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% set heading = "تعديل حساب وكيل" if account else "إضافة حساب وكيل" %}
+{% set subheading = "حدد الحساب والراوترات والصلاحيات بدقة" %}
+{% block content %}
+<form method="post" class="agent-account-form" id="agentAccountForm">
+  <section class="panel">
+    <div class="panel-head"><div><h2>بيانات الدخول</h2><p>اسم المستخدم إنكليزي، وكلمة المرور 8 أحرف على الأقل.</p></div></div>
+    <div class="form-grid">
+      <div><label>الاسم الظاهر</label><input name="display_name" value="{{ account.display_name if account else '' }}" placeholder="مثلاً: وكيل النجف" required></div>
+      <div><label>اسم المستخدم</label><input name="username" dir="ltr" value="{{ account.username if account else '' }}" placeholder="najaf.agent" required></div>
+      <div><label>{{ 'كلمة مرور جديدة (اتركها فارغة بدون تغيير)' if account else 'كلمة المرور' }}</label><input type="password" name="password" minlength="8" {{ '' if account else 'required' }} autocomplete="new-password"></div>
+      <label class="permission-option account-enable-option"><input type="checkbox" name="enabled" {{ 'checked' if not account or account.enabled else '' }}><span><b>الحساب فعال</b><small>إلغاء التحديد يمنع تسجيل الدخول فوراً.</small></span></label>
+    </div>
+  </section>
+  <section class="panel">
+    <div class="panel-head"><div><h2>الراوترات المسموحة</h2><p>الوكيل لن يرى أي راوتر غير المحدد هنا.</p></div><button class="btn mini" type="button" id="toggleAllRouters">تحديد الكل</button></div>
+    <div class="router-assignment-grid">
+    {% for peer in peers %}<label class="router-assignment-option"><input type="checkbox" name="peer_ids" value="{{ peer.id }}" {{ 'checked' if peer.id in selected_peer_ids else '' }}><span class="assignment-state {{ 'online-mark' if peer.enabled else 'offline-mark' }}"></span><span><b>{{ peer.name }}</b><small dir="ltr">{{ peer.tunnel_ip }}</small></span></label>{% else %}<div class="empty">أضف الراوترات أولاً</div>{% endfor %}
+    </div>
+  </section>
+  {% for group_title,permissions in permission_groups %}
+  <section class="panel permission-group-panel">
+    <div class="panel-head"><div><h2>{{ group_title }}</h2><p>كل اختيار ينحفظ ويتطبق على الباكند والواجهة.</p></div><button class="btn mini group-toggle" type="button">تحديد المجموعة</button></div>
+    <div class="permission-grid">
+    {% for field,label,description in permissions %}
+      {% set default_checked = field in ['can_view_routers','can_view_router_status','can_view_handshake','can_view_traffic','can_view_ping','can_view_subscribers','can_view_subscriber_ip','can_copy_subscriber_ip','can_open_subscriber','can_view_winbox','can_copy_winbox','can_open_webfig','can_view_vpn_access','can_view_mobile_qr','can_download_mobile_config','can_download_windows_config','can_view_notes','can_change_password'] %}
+      <label class="permission-option {{ 'read-only-permission' if field=='read_only' else '' }}"><input type="checkbox" name="{{ field }}" {{ 'checked' if (account and account[field]) or (not account and default_checked) else '' }}><span><b>{{ label }}</b><small>{{ description }}</small></span></label>
+    {% endfor %}
+    </div>
+  </section>
+  {% endfor %}
+  <div class="sticky-form-actions"><a class="btn" href="{{ url_for('agent_accounts_page') }}">إلغاء</a><button class="btn primary">{{ 'حفظ التعديلات' if account else 'إنشاء حساب الوكيل' }}</button></div>
+</form>
+<script>
+(function(){
+  const routerChecks=Array.from(document.querySelectorAll('input[name="peer_ids"]'));
+  document.getElementById('toggleAllRouters').addEventListener('click',function(){const value=routerChecks.some(function(item){return !item.checked});routerChecks.forEach(function(item){item.checked=value})});
+  document.querySelectorAll('.group-toggle').forEach(function(button){button.addEventListener('click',function(){const checks=Array.from(button.closest('.permission-group-panel').querySelectorAll('input[type="checkbox"]'));const value=checks.some(function(item){return !item.checked});checks.forEach(function(item){item.checked=value})})});
+  const readOnly=document.querySelector('input[name="read_only"]');
+  const mutations=['can_add_subscriber','can_edit_subscriber','can_delete_subscriber','can_sync_subscribers','can_edit_notes','can_change_password'];
+  function applyReadOnly(){if(!readOnly)return;mutations.forEach(function(name){const input=document.querySelector('input[name="'+name+'"]');if(input){if(readOnly.checked)input.checked=false;input.disabled=readOnly.checked}})}
+  if(readOnly){readOnly.addEventListener('change',applyReadOnly);applyReadOnly()}
+})();
+</script>
+{% endblock %}

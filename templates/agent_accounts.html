@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% set portal_agent = agent_account is not none %}
+{% set heading = "الوكلاء" %}
+{% set subheading = "إدارة حسابات الوكلاء والراوترات المسموحة" if not portal_agent else "معلومات حساب الوكيل والراوترات المسموحة" %}
+{% block content %}
+<section class="panel">
+  <div class="panel-head"><div><h2>حسابات الوكلاء</h2><p>{{ 'تعديل الحساب والراوترات من هنا، والصلاحيات بصفحة مستقلة.' if not portal_agent else 'تظهر هنا بيانات حسابك والراوترات المخصصة إلك.' }}</p></div><div class="header-action-pair"><a class="btn" href="{{ url_for('agent_permissions_overview' if portal_agent else 'permissions_page') }}">الصلاحيات</a>{% if not portal_agent %}<a class="btn primary" href="{{ url_for('agent_account_add') }}">إضافة وكيل</a>{% endif %}</div></div>
+  <div class="agent-account-grid">
+  {% for item in accounts %}
+    <article class="agent-account-card {{ 'account-enabled' if item.enabled else 'account-disabled' }}">
+      <div class="agent-account-card-head"><div class="agent-account-name"><span class="account-avatar">{{ (item.display_name or item.username)[0]|upper }}</span><div><h3>{{ item.display_name or item.username }}</h3><p dir="ltr">{{ item.username }}</p></div></div><span class="status {{ 'on' if item.enabled else 'off' }}">{{ 'فعال' if item.enabled else 'موقوف' }}</span></div>
+      <div class="agent-account-meta"><div><span>الراوترات</span><b>{{ item.peer_count }}</b></div><div><span>الصلاحيات</span><b>{{ item.permission_count }}</b></div><div><span>آخر دخول</span><b>{{ item.last_login_at or '-' }}</b></div></div>
+      <div class="assigned-router-names"><span>الراوترات المسموحة</span><p>{{ item.peer_names or 'لم يتم تعيين راوتر' }}</p></div>
+      <div class="agent-account-actions">
+        {% if portal_agent %}
+          <a class="btn primary" href="{{ url_for('agent_routers_page') }}">عرض الراوترات</a>
+          <a class="btn" href="{{ url_for('agent_permissions_detail') }}">عرض الصلاحيات</a>
+        {% else %}
+          <a class="btn primary" href="{{ url_for('agent_account_edit', account_id=item.id) }}">تعديل الوكيل</a>
+          <a class="btn" href="{{ url_for('permission_edit', account_id=item.id) }}">تعديل الصلاحيات</a>
+          <form method="post" action="{{ url_for('agent_account_toggle', account_id=item.id) }}"><button class="btn warning wide">{{ 'إيقاف' if item.enabled else 'تشغيل' }}</button></form>
+          <form method="post" action="{{ url_for('agent_account_delete', account_id=item.id) }}" onsubmit="return confirm('حذف حساب الوكيل؟')"><button class="btn danger wide">حذف</button></form>
+        {% endif %}
+      </div>
+    </article>
+  {% else %}<div class="empty">لا توجد حسابات وكلاء حالياً</div>{% endfor %}
+  </div>
+</section>
+{% endblock %}

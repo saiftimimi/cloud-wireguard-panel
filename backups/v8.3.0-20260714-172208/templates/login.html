@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="ar" dir="rtl" data-theme="dark" data-applied-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#050b18">
+  <title>تسجيل الدخول — {{ settings.system_name }}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
+</head>
+<body class="login-page unified-login-page">
+  <div class="login-glow one"></div>
+  <div class="login-glow two"></div>
+
+  <main class="unified-login-wrap">
+    <section class="login-card unified-login-card" aria-labelledby="loginTitle">
+      <img class="login-logo" src="{{ url_for('static', filename='images/logo.png') }}" alt="{{ settings.system_name }}">
+      <h1 id="loginTitle">{{ settings.system_name }}</h1>
+      <p>دخول موحّد للإدارة والوكلاء</p>
+
+      {% with messages = get_flashed_messages(with_categories=true) %}
+        {% for category, message in messages %}
+          <div class="alert {{ category }}">{{ message }}</div>
+        {% endfor %}
+      {% endwith %}
+
+      <form method="post" class="unified-login-form">
+        <label for="loginUsername">اسم المستخدم</label>
+        <input id="loginUsername" name="username" autocomplete="username" required autofocus dir="ltr">
+
+        <label for="loginPassword">كلمة المرور</label>
+        <input id="loginPassword" type="password" name="password" autocomplete="current-password" required dir="ltr">
+
+        <button class="btn primary wide" type="submit">تسجيل الدخول</button>
+      </form>
+
+      <div class="login-foot">Secure • Fast • Reliable</div>
+    </section>
+  </main>
+</body>
+</html>

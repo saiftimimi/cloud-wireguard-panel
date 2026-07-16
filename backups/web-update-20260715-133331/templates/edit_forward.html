@@ -1,0 +1,134 @@
+{% extends "base.html" %}
+{% set portal_agent = agent_account is not none %}
+{% set heading = "تعديل تحويل المشترك" %}
+{% set subheading = item.name %}
+{% block content %}
+{% set return_url = request.args.get('next') or url_for('agent_router_subscribers_page' if portal_agent else 'router_subscribers_page', peer_id=item.peer_id) %}
+<section class="panel">
+  <div class="panel-head">
+    <div>
+      <h2>بيانات التحويل</h2>
+      <p>{{ settings.endpoint }}:{{ item.external_port }} → {{ item.internal_ip }}:{{ item.internal_port }}</p>
+    </div>
+  </div>
+
+  <form method="post" action="{{ url_for('agent_subscriber_edit' if portal_agent else 'port_forward_edit', forward_id=item.id, next=return_url) }}" id="edit-forward-form">
+    <div class="form-grid">
+      <div>
+        <label>الراوتر / الوكيل</label>
+        <select name="peer_id" id="peer-select" required>
+          {% for peer in peers %}
+            <option value="{{ peer.id }}" {% if peer.id == item.peer_id %}selected{% endif %}>
+              {{ peer.name }} — {{ peer.tunnel_ip }}
+            </option>
+          {% endfor %}
+        </select>
+      </div>
+
+      <div>
+        <label>المشترك</label>
+        <select id="subscriber-select" required>
+          <option value="{{ item.internal_ip }}" data-name="{{ item.name }}">
+            {{ item.name }} — {{ item.internal_ip }}
+          </option>
+        </select>
+        <small id="subscriber-status">جاري تحديث قائمة هذا الراوتر</small>
+      </div>
+
+      <div>
+        <label>اسم المشترك</label>
+        <input id="subscriber-name" value="{{ item.name }}" readonly>
+      </div>
+
+      <div>
+        <label>IP المشترك الداخلي</label>
+        <input name="internal_ip" id="subscriber-ip" value="{{ item.internal_ip }}" readonly required dir="ltr">
+      </div>
+
+      <div>
+        <label>البورت الداخلي</label>
+        <input name="internal_port" type="number" min="1" max="65535" value="{{ item.internal_port }}" required dir="ltr">
+      </div>
+
+      <div>
+        <label>البروتوكول</label>
+        <select name="protocol">
+          <option value="tcp" {% if item.protocol == 'tcp' %}selected{% endif %}>TCP</option>
+          <option value="udp" {% if item.protocol == 'udp' %}selected{% endif %}>UDP</option>
+          <option value="both" {% if item.protocol == 'both' %}selected{% endif %}>TCP + UDP</option>
+        </select>
+      </div>
+
+      <div>
+        <label>البورت الخارجي</label>
+        <input name="external_port" type="number" min="20001" max="65535" value="{{ item.external_port }}" required dir="ltr">
+      </div>
+
+      <div class="checkbox-row">
+        <label><input type="checkbox" name="enabled" {% if item.enabled %}checked{% endif %}> التحويل فعال</label>
+      </div>
+    </div>
+
+    <button class="btn primary">حفظ وتطبيق</button>
+    <a class="btn" href="{{ return_url }}">رجوع</a>
+  </form>
+</section>
+
+<script>
+(function () {
+  const peer = document.getElementById("peer-select");
+  const subscriber = document.getElementById("subscriber-select");
+  const nameInput = document.getElementById("subscriber-name");
+  const ipInput = document.getElementById("subscriber-ip");
+  const status = document.getElementById("subscriber-status");
+  const currentIp = "{{ item.internal_ip }}";
+
+  async function loadSubscribers(preferredIp) {
+    status.textContent = "جاري جلب مشتركي الراوتر...";
+    subscriber.disabled = true;
+    try {
+      const apiPrefix = {{ ('/agent/api/peers/' if portal_agent else '/api/peers/')|tojson }};
+      const response = await fetch(apiPrefix + peer.value + "/subscribers", {
+        credentials: "same-origin",
+        cache: "no-store"
+      });
+      const data = await response.json();
+      if (!response.ok || !data.ok) {
+        throw new Error(data.error || "فشل جلب المشتركين");
+      }
+
+      subscriber.innerHTML = "";
+      data.subscribers.forEach(function (item) {
+        const option = document.createElement("option");
+        option.value = item.ip;
+        option.dataset.name = item.name;
+        option.textContent = item.name + " — " + item.ip + " — " + item.source;
+        if (item.ip === preferredIp) option.selected = true;
+        subscriber.appendChild(option);
+      });
+
+      subscriber.disabled = false;
+      status.textContent = "تم جلب " + data.count + " مشترك";
+      if (subscriber.options.length) {
+        subscriber.dispatchEvent(new Event("change"));
+      }
+    } catch (error) {
+      status.textContent = error.message;
+    }
+  }
+
+  peer.addEventListener("change", function () {
+    loadSubscribers("");
+  });
+
+  subscriber.addEventListener("change", function () {
+    const selected = subscriber.options[subscriber.selectedIndex];
+    if (!selected) return;
+    ipInput.value = selected.value;
+    nameInput.value = selected.dataset.name || selected.value;
+  });
+
+  loadSubscribers(currentIp);
+})();
+</script>
+{% endblock %}

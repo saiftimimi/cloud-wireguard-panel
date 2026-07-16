@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="{{ ui_language }}" dir="{{ ui_direction }}" data-theme="{{ ui_theme }}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{{ t('login') }}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
+</head>
+
+<div class="ui-controls">
+  <div class="language-switcher">
+    <button type="button" class="ui-icon-button" data-ui-menu="language" aria-label="{{ t('language') }}">🌐</button>
+    <div class="ui-popover" data-ui-popover="language">
+      <strong>{{ t('language') }}</strong>
+      {% for code,meta in supported_languages.items() %}
+      <button type="button" class="ui-choice {{ 'active' if ui_language==code else '' }}" data-language="{{ code }}">{{ meta.label }}</button>
+      {% endfor %}
+    </div>
+  </div>
+
+  <div class="theme-switcher">
+    <button type="button" class="ui-icon-button" data-ui-menu="theme" aria-label="{{ t('theme') }}">◐</button>
+    <div class="ui-popover" data-ui-popover="theme">
+      <strong>{{ t('theme') }}</strong>
+      <button type="button" class="ui-choice" data-theme="dark">{{ t('dark') }}</button>
+      <button type="button" class="ui-choice" data-theme="light">{{ t('light') }}</button>
+      <button type="button" class="ui-choice" data-theme="auto">{{ t('auto') }}</button>
+    </div>
+  </div>
+
+  <div class="notification-center">
+    <button type="button" class="ui-icon-button notification-button" data-ui-menu="notifications" aria-label="{{ t('notifications') }}">
+      🔔
+      <span class="notification-count {{ 'hidden' if notification_unread==0 else '' }}" id="notificationCount">{{ notification_unread }}</span>
+    </button>
+    <div class="ui-popover notification-popover" data-ui-popover="notifications">
+      <div class="notification-head">
+        <strong>{{ t('notifications') }}</strong>
+        <button type="button" id="markNotificationsRead">{{ t('mark_all_read') }}</button>
+      </div>
+      <div class="notification-list" id="notificationList">
+        {% for item in notification_items %}
+        <article class="notification-item {{ item.kind }} {{ 'unread' if not item.is_read else '' }}">
+          <b>{{ item.title }}</b>
+          <p>{{ item.message }}</p>
+          <small>{{ item.created_at }}</small>
+        </article>
+        {% else %}
+        <div class="empty-notifications">{{ t('no_notifications') }}</div>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+</div>
+
+<body class="login-page">
+  <div class="login-glow one"></div>
+  <div class="login-glow two"></div>
+  <section class="login-card">
+    <img class="login-logo" src="{{ url_for('static', filename='images/logo.png') }}" alt="logo">
+    <h1>{{ settings.system_name }}</h1>
+    <p>إدارة آمنة لاتصالات WireGuard وMikroTik</p>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% for category, message in messages %}
+        <div class="alert {{ category }}">{{ message }}</div>
+      {% endfor %}
+    {% endwith %}
+
+    <form method="post">
+      <label>{{ t('username') }}</label>
+      <input name="username" autocomplete="username" required autofocus>
+      <label>{{ t('password') }}</label>
+      <input type="password" name="password" autocomplete="current-password" required>
+      <button class="btn primary wide">{{ t('login') }}</button>
+    </form>
+    <a class="portal-switch-link" href="{{ url_for('agent_login') }}">دخول بوابة الوكلاء</a>
+    <div class="login-foot">Secure • Fast • Reliable</div>
+  </section>
+
+<script>
+(function () {
+  const root = document.documentElement;
+  const initialTheme = root.dataset.theme || "dark";
+
+  function appliedTheme(value) {
+    if (value !== "auto") return value;
+    return window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+  }
+
+  function applyTheme(value) {
+    root.dataset.theme = value;
+    root.dataset.appliedTheme = appliedTheme(value);
+    localStorage.setItem("cloud-ui-theme", value);
+  }
+
+  async function savePreference(payload) {
+    try {
+      await fetch("{{ url_for('ui_preferences') }}", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(payload)
+      });
+    } catch (error) {}
+  }
+
+  applyTheme(localStorage.getItem("cloud-ui-theme") || initialTheme);
+
+  document.querySelectorAll("[data-ui-menu]").forEach(function (button) {
+    button.addEventListener("click", function (event) {
+      event.stopPropagation();
+      const name = button.dataset.uiMenu;
+      document.querySelectorAll("[data-ui-popover]").forEach(function (popover) {
+        popover.classList.toggle("open", popover.dataset.uiPopover === name && !popover.classList.contains("open"));
+      });
+    });
+  });
+
+  document.addEventListener("click", function () {
+    document.querySelectorAll("[data-ui-popover]").forEach(function (p) { p.classList.remove("open"); });
+  });
+
+  document.querySelectorAll(".ui-popover").forEach(function (p) {
+    p.addEventListener("click", function (e) { e.stopPropagation(); });
+  });
+
+  document.querySelectorAll("[data-theme]").forEach(function (button) {
+    button.addEventListener("click", async function () {
+      const theme = button.dataset.theme;
+      applyTheme(theme);
+      await savePreference({theme: theme});
+    });
+  });
+
+  document.querySelectorAll("[data-language]").forEach(function (button) {
+    button.addEventListener("click", async function () {
+      await savePreference({language: button.dataset.language});
+      window.location.reload();
+    });
+  });
+
+  const markRead = document.getElementById("markNotificationsRead");
+  if (markRead) {
+    markRead.addEventListener("click", async function () {
+      await fetch("{{ url_for('notifications_read_all_api') }}", {method: "POST"});
+      document.querySelectorAll(".notification-item").forEach(function (item) { item.classList.remove("unread"); });
+      const count = document.getElementById("notificationCount");
+      if (count) { count.textContent = "0"; count.classList.add("hidden"); }
+    });
+  }
+
+  async function refreshNotifications() {
+    if (document.hidden) return;
+    try {
+      const response = await fetch("{{ url_for('notifications_api') }}", {cache: "no-store"});
+      if (!response.ok) return;
+      const data = await response.json();
+      const count = document.getElementById("notificationCount");
+      if (count) {
+        count.textContent = data.unread;
+        count.classList.toggle("hidden", !data.unread);
+      }
+    } catch (error) {}
+  }
+  setInterval(refreshNotifications, 20000);
+})();
+</script>
+
+</body>
+</html>

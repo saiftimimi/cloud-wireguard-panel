@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="{{ ui_language }}" dir="rtl" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#050814">
+  <title>{{ t('login') }} — {{ settings.system_name }}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}?v={{ cloud_version|default('10.2.0') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/cloud-pro.css') }}?v=10.2.0">
+</head>
+<body class="cloud-login-page">
+  <div class="login-orb login-orb-a"></div><div class="login-orb login-orb-b"></div>
+  <main class="cloud-login-shell">
+    <section class="login-brand-panel">
+      <div class="login-brand-mark"><img src="{{ url_for('static', filename='images/logo.png') }}" alt="{{ settings.system_name }}"></div>
+      <span class="login-kicker">CLOUD NETWORK OPERATIONS</span>
+      <h1>{{ settings.system_name }}</h1>
+      <p>منصة موحّدة لإدارة الراوترات، WireGuard، المشتركين والوكلاء من مكان واحد.</p>
+      <div class="login-feature-list">
+        <div><i>✓</i><span><b>إدارة مركزية</b><small>تحكم كامل بالراوترات والاتصالات</small></span></div>
+        <div><i>✓</i><span><b>مراقبة مباشرة</b><small>حالة الشبكة والخدمات لحظة بلحظة</small></span></div>
+        <div><i>✓</i><span><b>وصول آمن</b><small>WireGuard وصلاحيات دقيقة للوكلاء</small></span></div>
+      </div>
+      <div class="login-brand-footer"><span class="pulse-dot"></span> النظام جاهز وآمن</div>
+    </section>
+
+    <section class="login-form-panel">
+      <div class="login-mobile-logo"><img src="{{ url_for('static', filename='images/logo.png') }}" alt="logo"></div>
+      <div class="login-form-head"><span>تسجيل الدخول</span><h2>مرحباً بعودتك</h2><p>أدخل بيانات حساب الإدارة للمتابعة</p></div>
+      {% with messages = get_flashed_messages(with_categories=true) %}{% for category, message in messages %}<div class="alert {{ category }}">{{ message }}</div>{% endfor %}{% endwith %}
+      <form method="post" action="{{ url_for('login') }}" class="cloud-login-form">
+        <label for="loginUsername">{{ t('username') }}</label>
+        <div class="login-input-wrap"><span>♙</span><input id="loginUsername" name="username" autocomplete="username" required autofocus dir="ltr" placeholder="admin"></div>
+        <label for="loginPassword">{{ t('password') }}</label>
+        <div class="login-input-wrap"><span>◆</span><input id="loginPassword" type="password" name="password" autocomplete="current-password" required dir="ltr" placeholder="••••••••"></div>
+        <button class="cloud-login-button" type="submit"><span>{{ t('login') }}</span><b>←</b></button>
+      </form>
+      <div class="login-security"><span>🔒</span> اتصال مشفر ومحمي</div>
+    </section>
+  </main>
+</body>
+</html>

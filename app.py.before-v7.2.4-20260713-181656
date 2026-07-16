@@ -1,0 +1,3331 @@
+#!/usr/bin/env python3
+import base64
+import hashlib
+import io
+import ipaddress
+import os
+import re
+import secrets
+import socket
+import sqlite3
+import ssl
+import struct
+import tempfile
+import shutil
+import subprocess
+import threading
+import time
+from datetime import datetime
+from functools import wraps
+from pathlib import Path
+
+import qrcode
+from cryptography.fernet import Fernet, InvalidToken
+from flask import (
+    Flask, flash, jsonify, redirect, render_template, request,
+    send_file, session, url_for
+)
+from werkzeug.security import check_password_hash, generate_password_hash
+
+APP_DIR = Path(__file__).resolve().parent
+DB_PATH = APP_DIR / "data.db"
+SECRET_PATH = APP_DIR / ".secret"
+WG_DIR = Path("/etc/wireguard")
+
+DEFAULT_INTERFACE = "wg-cloud0"
+DEFAULT_ENDPOINT = "194.99.20.36"
+DEFAULT_PORT = 51820
+DEFAULT_ADDRESS = "172.94.94.1/24"
+
+app = Flask(__name__)
+
+if SECRET_PATH.exists():
+    APP_SECRET = SECRET_PATH.read_text().strip()
+else:
+    APP_SECRET = secrets.token_hex(32)
+    SECRET_PATH.write_text(APP_SECRET)
+    os.chmod(str(SECRET_PATH), 0o600)
+
+app.secret_key = APP_SECRET
+app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+
+
+def db():
+    con = sqlite3.connect(str(DB_PATH))
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def has_column(con, table, column):
+    return any(row[1] == column for row in con.execute("PRAGMA table_info(%s)" % table))
+
+
+def init_db():
+    con = db()
+    con.executescript("""
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        role TEXT NOT NULL DEFAULT 'admin'
+    );
+
+    CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS peers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        tunnel_ip TEXT UNIQUE NOT NULL,
+        lan_ips TEXT DEFAULT '',
+        public_ips TEXT DEFAULT '',
+        private_key TEXT NOT NULL DEFAULT '',
+        public_key TEXT NOT NULL,
+        preshared_key TEXT NOT NULL DEFAULT '',
+        enabled INTEGER NOT NULL DEFAULT 1,
+        notes TEXT DEFAULT ''
+    );
+
+    CREATE TABLE IF NOT EXISTS port_forwards (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        peer_id INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        internal_ip TEXT NOT NULL,
+        internal_port INTEGER NOT NULL,
+        external_port INTEGER NOT NULL UNIQUE,
+        protocol TEXT NOT NULL DEFAULT 'tcp',
+        enabled INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL DEFAULT '',
+        updated_at TEXT NOT NULL DEFAULT '',
+        last_applied_at TEXT NOT NULL DEFAULT '',
+        last_error TEXT NOT NULL DEFAULT ''
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_port_forwards_peer
+        ON port_forwards(peer_id);
+    """)
+
+    migrations = [
+        ("mt_host", "TEXT DEFAULT ''"),
+        ("mt_port", "INTEGER DEFAULT 8728"),
+        ("mt_username", "TEXT DEFAULT ''"),
+        ("mt_password_enc", "TEXT DEFAULT ''"),
+        ("mt_ssl", "INTEGER DEFAULT 0"),
+        ("winbox_internal", "INTEGER DEFAULT 8291"),
+        ("winbox_external", "INTEGER DEFAULT 0"),
+        ("created_at", "TEXT DEFAULT ''"),
+        ("imported_from_wg", "INTEGER DEFAULT 0"),
+        ("source_comment", "TEXT DEFAULT ''"),
+    ]
+    for column, definition in migrations:
+        if not has_column(con, "peers", column):
+            con.execute("ALTER TABLE peers ADD COLUMN %s %s" % (column, definition))
+
+    pf_migrations = [
+        ("subscriber_key", "TEXT DEFAULT ''"),
+        ("subscriber_source", "TEXT DEFAULT ''"),
+        ("auto_managed", "INTEGER DEFAULT 0"),
+        ("last_seen_at", "TEXT DEFAULT ''"),
+    ]
+    for column, definition in pf_migrations:
+        if not has_column(con, "port_forwards", column):
+            con.execute(
+                "ALTER TABLE port_forwards ADD COLUMN %s %s"
+                % (column, definition)
+            )
+
+    # Existing v7.0 records were created by the automatic import module.
+    # Mark them managed once so disconnected users can be removed.
+    migration_flag = con.execute(
+        "SELECT value FROM settings WHERE key='subscriber_v71_migrated'"
+    ).fetchone()
+    if not migration_flag:
+        con.execute(
+            "UPDATE port_forwards SET auto_managed=1 "
+            "WHERE auto_managed=0"
+        )
+        con.execute(
+            "INSERT OR REPLACE INTO settings(key,value) "
+            "VALUES('subscriber_v71_migrated','1')"
+        )
+
+    if not con.execute("SELECT id FROM users WHERE username='admin'").fetchone():
+        con.execute(
+            "INSERT INTO users(username,password_hash,role) VALUES(?,?,?)",
+            ("admin", generate_password_hash("admin123"), "admin")
+        )
+
+    defaults = {
+        "interface": DEFAULT_INTERFACE,
+        "endpoint": DEFAULT_ENDPOINT,
+        "port": str(DEFAULT_PORT),
+        "address": DEFAULT_ADDRESS,
+        "dns": "1.1.1.1",
+        "mtu": "1420",
+        "out_interface": "",
+        "system_name": "Cloud WG Panel",
+        "pf_port_start": "20001",
+        "pf_port_end": "65000",
+        "subscriber_sync_enabled": "1",
+        "subscriber_sync_seconds": "60",
+        "subscriber_default_port": "80",
+        "subscriber_default_protocol": "tcp",
+    }
+    for key, value in defaults.items():
+        con.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (key, value))
+
+    current_pf_start = con.execute(
+        "SELECT value FROM settings WHERE key='pf_port_start'"
+    ).fetchone()
+    if not current_pf_start or int(current_pf_start[0] or 0) < 20001:
+        con.execute(
+            "INSERT OR REPLACE INTO settings(key,value) VALUES('pf_port_start','20001')"
+        )
+
+    current_address = con.execute("SELECT value FROM settings WHERE key='address'").fetchone()
+    if current_address and current_address[0] in ('10.77.0.1/24', '10.77.0.1/24, 172.94.94.1/24'):
+        con.execute("UPDATE settings SET value=? WHERE key='address'", (DEFAULT_ADDRESS,))
+    con.commit()
+    con.close()
+
+
+def get_settings():
+    con = db()
+    rows = con.execute("SELECT key,value FROM settings").fetchall()
+    con.close()
+    return {row["key"]: row["value"] for row in rows}
+
+
+def run(cmd, input_text=None, check=True):
+    proc = subprocess.run(
+        cmd,
+        input=input_text.encode() if input_text else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE
+    )
+    if check and proc.returncode != 0:
+        raise RuntimeError(proc.stderr.decode(errors="ignore").strip() or "Command failed")
+    return proc.stdout.decode(errors="ignore").strip()
+
+
+def cipher():
+    raw = hashlib.sha256(APP_SECRET.encode()).digest()
+    return Fernet(base64.urlsafe_b64encode(raw))
+
+
+def encrypt_text(value):
+    if not value:
+        return ""
+    return cipher().encrypt(value.encode()).decode()
+
+
+def decrypt_text(value):
+    if not value:
+        return ""
+    try:
+        return cipher().decrypt(value.encode()).decode()
+    except InvalidToken:
+        return ""
+
+
+
+def tcp_listener_uses_port(port):
+    proc = subprocess.run(
+        ["ss", "-lntH"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE
+    )
+    if proc.returncode != 0:
+        return False
+    suffix = ":%d" % int(port)
+    for line in proc.stdout.decode(errors="ignore").splitlines():
+        parts = line.split()
+        if len(parts) >= 4 and parts[3].endswith(suffix):
+            return True
+    return False
+
+
+def next_external_port(start=10001, end=19999):
+    con = db()
+    used = {
+        int(row["winbox_external"])
+        for row in con.execute(
+            "SELECT winbox_external FROM peers WHERE winbox_external > 0"
+        ).fetchall()
+    }
+    con.close()
+
+    for port in range(start, end + 1):
+        if port not in used and not tcp_listener_uses_port(port):
+            return port
+    raise RuntimeError("لا يوجد بورت WinBox خارجي فارغ")
+
+
+def validate_external_port(port, peer_id=None):
+    port = int(port)
+    if port < 1 or port > 65535:
+        raise RuntimeError("البورت الخارجي غير صحيح")
+
+    con = db()
+    if peer_id is None:
+        row = con.execute(
+            "SELECT name FROM peers WHERE winbox_external=? LIMIT 1",
+            (port,)
+        ).fetchone()
+    else:
+        row = con.execute(
+            "SELECT name FROM peers WHERE winbox_external=? AND id<>? LIMIT 1",
+            (port, int(peer_id))
+        ).fetchone()
+    con.close()
+
+    if row:
+        raise RuntimeError("البورت مستخدم من الوكيل: %s" % row["name"])
+    if tcp_listener_uses_port(port):
+        raise RuntimeError("البورت مستخدم من خدمة أخرى على Ubuntu")
+    return True
+
+
+
+def _listener_uses_port(port, protocol):
+    protocol = protocol.lower()
+    command = ["ss", "-lntH"] if protocol == "tcp" else ["ss", "-lnuH"]
+    proc = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode != 0:
+        return False
+
+    suffix = ":%d" % int(port)
+    for line in proc.stdout.decode(errors="ignore").splitlines():
+        parts = line.split()
+        if len(parts) >= 4 and parts[3].endswith(suffix):
+            return True
+    return False
+
+
+def validate_forward_protocol(value):
+    value = (value or "tcp").strip().lower()
+    if value not in ("tcp", "udp", "both"):
+        raise RuntimeError("البروتوكول يجب أن يكون TCP أو UDP أو الاثنين")
+    return value
+
+
+def normalize_internal_ip(value):
+    try:
+        address = ipaddress.ip_address((value or "").strip())
+    except Exception:
+        raise RuntimeError("IP المشترك الداخلي غير صحيح")
+    if address.version != 4:
+        raise RuntimeError("حالياً التحويل يدعم IPv4 فقط")
+    if address.is_unspecified or address.is_multicast or address.is_loopback:
+        raise RuntimeError("IP المشترك الداخلي غير مسموح")
+    return str(address)
+
+
+def _reserved_external_ports(exclude_forward_id=None):
+    con = db()
+    used = {
+        int(row["winbox_external"])
+        for row in con.execute(
+            "SELECT winbox_external FROM peers WHERE winbox_external > 0"
+        ).fetchall()
+    }
+
+    if exclude_forward_id is None:
+        rows = con.execute(
+            "SELECT external_port FROM port_forwards"
+        ).fetchall()
+    else:
+        rows = con.execute(
+            "SELECT external_port FROM port_forwards WHERE id<>?",
+            (int(exclude_forward_id),)
+        ).fetchall()
+
+    used.update(int(row["external_port"]) for row in rows)
+    con.close()
+
+    settings = get_settings()
+    used.update({
+        22, 53, 80, 443, 1994, 8291, 8728, 8729, 9494,
+        int(settings.get("port", "51820") or 51820),
+    })
+    return used
+
+
+def validate_forward_external_port(port, forward_id=None):
+    try:
+        port = int(port)
+    except Exception:
+        raise RuntimeError("البورت الخارجي غير صحيح")
+
+    if port < 1024 or port > 65535:
+        raise RuntimeError("البورت الخارجي يجب أن يكون بين 1024 و65535")
+
+    if port in _reserved_external_ports(forward_id):
+        raise RuntimeError("البورت الخارجي مستخدم أو محجوز")
+
+    if _listener_uses_port(port, "tcp") or _listener_uses_port(port, "udp"):
+        raise RuntimeError("البورت مستخدم من خدمة على Ubuntu")
+    return port
+
+
+def next_forward_external_port():
+    settings = get_settings()
+    start = max(20001, int(settings.get("pf_port_start", "20001") or 20001))
+    end = min(65535, int(settings.get("pf_port_end", "65000") or 65000))
+    if start > end:
+        start, end = 20001, 65000
+
+    used = _reserved_external_ports()
+    for candidate in range(start, end + 1):
+        if candidate in used:
+            continue
+        if _listener_uses_port(candidate, "tcp"):
+            continue
+        if _listener_uses_port(candidate, "udp"):
+            continue
+        return candidate
+
+    raise RuntimeError("لا يوجد بورت خارجي فارغ ابتداءً من 20001")
+
+
+def _forward_protocols(value):
+    value = validate_forward_protocol(value)
+    return ("tcp", "udp") if value == "both" else (value,)
+
+
+def _router_remove_cloud_pf_rules(api):
+    for command in ("/ip/firewall/nat/print", "/ip/firewall/filter/print"):
+        rows = api.talk(command)
+        remove_command = command.replace("/print", "/remove")
+        for row in rows:
+            comment = row.get("comment", "")
+            if comment.startswith("CloudPF:") and row.get(".id"):
+                api.talk(remove_command, {".id": row[".id"]})
+
+
+def _router_add_port_forward(api, item):
+    for protocol in _forward_protocols(item["protocol"]):
+        base_comment = "CloudPF:%s:%s" % (item["id"], protocol)
+
+        api.talk("/ip/firewall/nat/add", {
+            "chain": "dstnat",
+            "action": "dst-nat",
+            "in-interface": "wg-cloud",
+            "protocol": protocol,
+            "dst-port": str(int(item["external_port"])),
+            "to-addresses": item["internal_ip"],
+            "to-ports": str(int(item["internal_port"])),
+            "comment": base_comment,
+            "place-before": "0",
+            "disabled": "no",
+        })
+
+        api.talk("/ip/firewall/filter/add", {
+            "chain": "forward",
+            "action": "accept",
+            "in-interface": "wg-cloud",
+            "protocol": protocol,
+            "dst-address": item["internal_ip"],
+            "dst-port": str(int(item["internal_port"])),
+            "connection-state": "new,established,related",
+            "comment": base_comment + ":allow",
+            "place-before": "0",
+            "disabled": "no",
+        })
+
+        api.talk("/ip/firewall/filter/add", {
+            "chain": "forward",
+            "action": "accept",
+            "out-interface": "wg-cloud",
+            "protocol": protocol,
+            "src-address": item["internal_ip"],
+            "src-port": str(int(item["internal_port"])),
+            "connection-state": "established,related",
+            "comment": base_comment + ":reply",
+            "place-before": "0",
+            "disabled": "no",
+        })
+
+
+def sync_peer_port_forwards(peer_id):
+    peer = get_peer_or_404(peer_id)
+    if not peer:
+        raise RuntimeError("الوكيل غير موجود")
+
+    con = db()
+    rows = con.execute(
+        """
+        SELECT * FROM port_forwards
+        WHERE peer_id=? AND enabled=1
+        ORDER BY id
+        """,
+        (int(peer_id),)
+    ).fetchall()
+    con.close()
+
+    api = connect_peer_api(peer)
+    try:
+        _router_remove_cloud_pf_rules(api)
+        for row in rows:
+            _router_add_port_forward(api, row)
+    finally:
+        api.close()
+
+    stamp = datetime.now().isoformat(timespec="seconds")
+    con = db()
+    con.execute(
+        """
+        UPDATE port_forwards
+        SET last_applied_at=?, last_error=''
+        WHERE peer_id=?
+        """,
+        (stamp, int(peer_id))
+    )
+    con.commit()
+    con.close()
+    return len(rows)
+
+
+def mark_forward_error(forward_id, error):
+    con = db()
+    con.execute(
+        "UPDATE port_forwards SET last_error=?, updated_at=? WHERE id=?",
+        (
+            str(error)[:1000],
+            datetime.now().isoformat(timespec="seconds"),
+            int(forward_id),
+        )
+    )
+    con.commit()
+    con.close()
+
+
+def get_forward_or_404(forward_id):
+    con = db()
+    row = con.execute(
+        """
+        SELECT pf.*, p.name AS peer_name, p.tunnel_ip, p.mt_host
+        FROM port_forwards pf
+        JOIN peers p ON p.id=pf.peer_id
+        WHERE pf.id=?
+        """,
+        (int(forward_id),)
+    ).fetchone()
+    con.close()
+    return row
+
+
+def _sync_forward_changes(peer_ids):
+    regenerate_nat_rules()
+    errors = []
+    for peer_id in sorted({int(value) for value in peer_ids if value}):
+        try:
+            sync_peer_port_forwards(peer_id)
+        except Exception as exc:
+            errors.append("الوكيل %s: %s" % (peer_id, exc))
+    if errors:
+        raise RuntimeError(" | ".join(errors))
+    return True
+
+
+def parse_ubuntu_wireguard_peers():
+    """Read peers from both the live WireGuard interface and wg-quick config.
+
+    Live `wg show ... dump` is authoritative for public key / AllowedIPs / traffic.
+    The config file is used to recover comments and PresharedKey when available.
+    """
+    settings = get_settings()
+    interface = settings.get("interface", "wg-cloud0").strip() or "wg-cloud0"
+    conf_path = Path("/etc/wireguard/%s.conf" % interface)
+
+    config_by_public = {}
+    config_by_ip = {}
+    if conf_path.exists():
+        current = None
+        pending_comment = ""
+        for raw_line in conf_path.read_text(errors="ignore").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith("#"):
+                pending_comment = line.lstrip("#").strip()
+                continue
+            if line == "[Peer]":
+                if current:
+                    pub = current.get("public_key", "")
+                    if pub:
+                        config_by_public[pub] = current
+                    for ip_value in current.get("allowed_ips", []):
+                        config_by_ip[ip_value] = current
+                current = {
+                    "comment": pending_comment,
+                    "public_key": "",
+                    "preshared_key": "",
+                    "allowed_ips": [],
+                }
+                pending_comment = ""
+                continue
+            if current is None or "=" not in line:
+                continue
+            key, value = [part.strip() for part in line.split("=", 1)]
+            if key == "PublicKey":
+                current["public_key"] = value
+            elif key == "PresharedKey":
+                current["preshared_key"] = value
+            elif key == "AllowedIPs":
+                current["allowed_ips"] = [
+                    item.strip() for item in value.split(",") if item.strip()
+                ]
+        if current:
+            pub = current.get("public_key", "")
+            if pub:
+                config_by_public[pub] = current
+            for ip_value in current.get("allowed_ips", []):
+                config_by_ip[ip_value] = current
+
+    peers = []
+    proc = subprocess.run(
+        ["wg", "show", interface, "dump"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if proc.returncode == 0:
+        lines = proc.stdout.decode(errors="ignore").splitlines()
+        for line in lines[1:]:
+            cols = line.split("\t")
+            if len(cols) < 8:
+                continue
+            public_key = cols[0].strip()
+            allowed_values = [x.strip() for x in cols[3].split(",") if x.strip()]
+            config_item = config_by_public.get(public_key)
+            if not config_item:
+                for value in allowed_values:
+                    if value in config_by_ip:
+                        config_item = config_by_ip[value]
+                        break
+            peers.append({
+                "comment": (config_item or {}).get("comment", ""),
+                "public_key": public_key,
+                "preshared_key": (config_item or {}).get("preshared_key", ""),
+                "allowed_ips": allowed_values,
+                "endpoint": cols[2],
+                "latest_handshake": int(cols[4] or 0),
+                "rx": int(cols[5] or 0),
+                "tx": int(cols[6] or 0),
+            })
+
+    # If the interface is temporarily down, still import from the config file.
+    if not peers:
+        peers = list(config_by_public.values())
+
+    return peers
+
+
+def import_peers_from_ubuntu():
+    parsed = parse_ubuntu_wireguard_peers()
+    debug_path = APP_DIR / "sync-debug.log"
+    debug_lines = [
+        "%s interface=%s found=%d" % (
+            datetime.now().isoformat(timespec="seconds"),
+            get_settings().get("interface", "wg-cloud0"),
+            len(parsed),
+        )
+    ]
+    if not parsed:
+        debug_path.write_text("\n".join(debug_lines) + "\n")
+        return 0
+
+    con = db()
+    imported = 0
+    updated = 0
+    skipped = 0
+    try:
+        used_ports = {
+            int(row["winbox_external"])
+            for row in con.execute(
+                "SELECT winbox_external FROM peers WHERE winbox_external > 0"
+            ).fetchall()
+        }
+
+        def allocate_port():
+            for candidate in range(10001, 20000):
+                if candidate in used_ports or tcp_listener_uses_port(candidate):
+                    continue
+                used_ports.add(candidate)
+                return candidate
+            raise RuntimeError("لا يوجد بورت WinBox خارجي فارغ")
+
+        for item in parsed:
+            public_key = (item.get("public_key") or "").strip()
+            if not public_key:
+                skipped += 1
+                debug_lines.append("skip: missing public key")
+                continue
+
+            tunnel_ip = ""
+            for allowed in item.get("allowed_ips", []):
+                try:
+                    network = ipaddress.ip_network(allowed, strict=False)
+                    if network.version == 4 and network.prefixlen == 32:
+                        tunnel_ip = str(network.network_address) + "/32"
+                        break
+                except Exception:
+                    continue
+
+            if not tunnel_ip:
+                skipped += 1
+                debug_lines.append("skip %s: no IPv4 /32 AllowedIPs (%s)" % (
+                    public_key, item.get("allowed_ips", [])
+                ))
+                continue
+
+            existing = con.execute(
+                "SELECT * FROM peers WHERE public_key=? OR tunnel_ip=? LIMIT 1",
+                (public_key, tunnel_ip)
+            ).fetchone()
+
+            if existing:
+                external = int(existing["winbox_external"] or 0)
+                if external <= 0:
+                    external = allocate_port()
+                con.execute(
+                    """UPDATE peers SET
+                       public_key=?, tunnel_ip=?, source_comment=?, imported_from_wg=1,
+                       mt_host=?, winbox_external=?
+                       WHERE id=?""",
+                    (
+                        public_key,
+                        tunnel_ip,
+                        item.get("comment", ""),
+                        tunnel_ip.split("/")[0],
+                        external,
+                        existing["id"],
+                    )
+                )
+                updated += 1
+                debug_lines.append("update id=%s ip=%s pub=%s port=%s" % (
+                    existing["id"], tunnel_ip, public_key, external
+                ))
+                continue
+
+            name = (item.get("comment") or "").strip()
+            if not name:
+                name = "Ubuntu Peer %s" % tunnel_ip.split("/")[0]
+            external_port = allocate_port()
+            peer_ip = tunnel_ip.split("/")[0]
+
+            con.execute(
+                """INSERT INTO peers(
+                    name,tunnel_ip,lan_ips,public_ips,private_key,public_key,preshared_key,
+                    enabled,notes,mt_host,mt_port,mt_username,mt_password_enc,mt_ssl,
+                    winbox_internal,winbox_external,created_at,imported_from_wg,source_comment
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'),?,?)""",
+                (
+                    name, tunnel_ip, "", "", "", public_key,
+                    item.get("preshared_key", ""), 1,
+                    "Imported automatically from Ubuntu WireGuard",
+                    peer_ip, 9494, "", "", 0, 8291, external_port, 1,
+                    item.get("comment", ""),
+                )
+            )
+            imported += 1
+            debug_lines.append("insert ip=%s pub=%s port=%s" % (
+                tunnel_ip, public_key, external_port
+            ))
+
+        con.commit()
+    except Exception as exc:
+        con.rollback()
+        debug_lines.append("ERROR: %s" % exc)
+        debug_path.write_text("\n".join(debug_lines) + "\n")
+        raise
+    finally:
+        con.close()
+
+    debug_lines.append("done imported=%d updated=%d skipped=%d" % (
+        imported, updated, skipped
+    ))
+    debug_path.write_text("\n".join(debug_lines) + "\n")
+    regenerate_nat_rules()
+    return imported
+
+def wg_keypair():
+    private_key = run(["wg", "genkey"])
+    public_key = run(["wg", "pubkey"], input_text=private_key)
+    psk = run(["wg", "genpsk"])
+    return private_key, public_key, psk
+
+
+def login_required(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not session.get("user_id"):
+            return redirect(url_for("login"))
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+def clean_networks(text):
+    result = []
+    for item in [x.strip() for x in text.replace("\n", ",").split(",") if x.strip()]:
+        ipaddress.ip_network(item, strict=False)
+        result.append(item)
+    return result
+
+
+def next_tunnel_ip():
+    settings = get_settings()
+    network = ipaddress.ip_network(settings.get("address", DEFAULT_ADDRESS), strict=False)
+    server_ip = ipaddress.ip_interface(settings.get("address", DEFAULT_ADDRESS)).ip
+
+    con = db()
+    used = set()
+    for row in con.execute("SELECT tunnel_ip FROM peers").fetchall():
+        try:
+            used.add(ipaddress.ip_interface(row["tunnel_ip"]).ip)
+        except Exception:
+            pass
+    con.close()
+
+    for host in network.hosts():
+        if host == server_ip:
+            continue
+        if host not in used:
+            return str(host) + "/32"
+    raise RuntimeError("لا يوجد IP فارغ داخل شبكة WireGuard")
+
+
+
+def next_winbox_port(start=10001, end=19999):
+    con = db()
+    used = set()
+    for row in con.execute("SELECT winbox_external FROM peers WHERE winbox_external > 0").fetchall():
+        used.add(int(row["winbox_external"]))
+    con.close()
+    for port in range(start, end + 1):
+        if port not in used:
+            return port
+    raise RuntimeError("لا يوجد بورت WinBox خارجي فارغ")
+
+
+def regenerate_nat_rules():
+    settings = get_settings()
+    interface = settings["interface"].strip()
+
+    con = db()
+    peers = con.execute("""
+        SELECT id,name,tunnel_ip,winbox_internal,winbox_external
+        FROM peers
+        WHERE enabled=1 AND winbox_external > 0
+        ORDER BY id
+    """).fetchall()
+
+    forwards = con.execute("""
+        SELECT pf.*, p.tunnel_ip, p.name AS peer_name
+        FROM port_forwards pf
+        JOIN peers p ON p.id=pf.peer_id
+        WHERE pf.enabled=1 AND p.enabled=1
+        ORDER BY pf.id
+    """).fetchall()
+    con.close()
+
+    def ensure_chain(table, chain):
+        command = ["iptables"]
+        if table:
+            command += ["-t", table]
+        subprocess.run(
+            command + ["-N", chain],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+        run(command + ["-F", chain])
+
+    def reset_jump(table, parent, chain, position="1"):
+        command = ["iptables"]
+        if table:
+            command += ["-t", table]
+        while subprocess.run(
+            command + ["-C", parent, "-j", chain],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        ).returncode == 0:
+            subprocess.run(
+                command + ["-D", parent, "-j", chain],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+        run(command + ["-I", parent, position, "-j", chain])
+
+    ensure_chain("nat", "CLOUD_WG_DNAT")
+    ensure_chain("nat", "CLOUD_WG_SNAT")
+    ensure_chain(None, "CLOUD_WG_FORWARD")
+    reset_jump("nat", "PREROUTING", "CLOUD_WG_DNAT")
+    reset_jump("nat", "POSTROUTING", "CLOUD_WG_SNAT")
+    reset_jump(None, "FORWARD", "CLOUD_WG_FORWARD")
+
+    script = [
+        "#!/usr/bin/env bash",
+        "set -e",
+        "iptables -t nat -N CLOUD_WG_DNAT 2>/dev/null || true",
+        "iptables -t nat -F CLOUD_WG_DNAT",
+        "while iptables -t nat -C PREROUTING -j CLOUD_WG_DNAT 2>/dev/null; do iptables -t nat -D PREROUTING -j CLOUD_WG_DNAT; done",
+        "iptables -t nat -I PREROUTING 1 -j CLOUD_WG_DNAT",
+        "iptables -t nat -N CLOUD_WG_SNAT 2>/dev/null || true",
+        "iptables -t nat -F CLOUD_WG_SNAT",
+        "while iptables -t nat -C POSTROUTING -j CLOUD_WG_SNAT 2>/dev/null; do iptables -t nat -D POSTROUTING -j CLOUD_WG_SNAT; done",
+        "iptables -t nat -I POSTROUTING 1 -j CLOUD_WG_SNAT",
+        "iptables -N CLOUD_WG_FORWARD 2>/dev/null || true",
+        "iptables -F CLOUD_WG_FORWARD",
+        "while iptables -C FORWARD -j CLOUD_WG_FORWARD 2>/dev/null; do iptables -D FORWARD -j CLOUD_WG_FORWARD; done",
+        "iptables -I FORWARD 1 -j CLOUD_WG_FORWARD",
+    ]
+
+    def apply_and_save(rule, shell_line):
+        run(rule)
+        script.append(shell_line)
+
+    # Existing direct WinBox forwarding to the MikroTik tunnel IP.
+    for peer in peers:
+        peer_ip = str(ipaddress.ip_interface(peer["tunnel_ip"]).ip)
+        internal = str(int(peer["winbox_internal"] or 8291))
+        external = str(int(peer["winbox_external"]))
+        label = "Cloud WinBox peer %s" % peer["id"]
+
+        apply_and_save(
+            ["iptables", "-t", "nat", "-A", "CLOUD_WG_DNAT",
+             "-p", "tcp", "--dport", external,
+             "-m", "comment", "--comment", label,
+             "-j", "DNAT", "--to-destination", "%s:%s" % (peer_ip, internal)],
+            "iptables -t nat -A CLOUD_WG_DNAT -p tcp --dport %s -m comment --comment %s -j DNAT --to-destination %s:%s"
+            % (external, repr(label), peer_ip, internal)
+        )
+        apply_and_save(
+            ["iptables", "-t", "nat", "-A", "CLOUD_WG_SNAT",
+             "-o", interface, "-d", peer_ip, "-p", "tcp", "--dport", internal,
+             "-j", "MASQUERADE"],
+            "iptables -t nat -A CLOUD_WG_SNAT -o %s -d %s -p tcp --dport %s -j MASQUERADE"
+            % (interface, peer_ip, internal)
+        )
+        apply_and_save(
+            ["iptables", "-A", "CLOUD_WG_FORWARD",
+             "-o", interface, "-d", peer_ip, "-p", "tcp", "--dport", internal,
+             "-m", "conntrack", "--ctstate", "NEW,ESTABLISHED,RELATED",
+             "-j", "ACCEPT"],
+            "iptables -A CLOUD_WG_FORWARD -o %s -d %s -p tcp --dport %s -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT"
+            % (interface, peer_ip, internal)
+        )
+        apply_and_save(
+            ["iptables", "-A", "CLOUD_WG_FORWARD",
+             "-i", interface, "-s", peer_ip, "-p", "tcp", "--sport", internal,
+             "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED",
+             "-j", "ACCEPT"],
+            "iptables -A CLOUD_WG_FORWARD -i %s -s %s -p tcp --sport %s -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
+            % (interface, peer_ip, internal)
+        )
+
+    # Two-stage forwarding:
+    # Public Ubuntu port -> MikroTik tunnel IP:same port -> subscriber IP:port.
+    for item in forwards:
+        peer_ip = str(ipaddress.ip_interface(item["tunnel_ip"]).ip)
+        external = str(int(item["external_port"]))
+
+        for protocol in _forward_protocols(item["protocol"]):
+            label = "CloudPF %s %s" % (item["id"], protocol)
+
+            apply_and_save(
+                ["iptables", "-t", "nat", "-A", "CLOUD_WG_DNAT",
+                 "-p", protocol, "--dport", external,
+                 "-m", "comment", "--comment", label,
+                 "-j", "DNAT", "--to-destination", "%s:%s" % (peer_ip, external)],
+                "iptables -t nat -A CLOUD_WG_DNAT -p %s --dport %s -m comment --comment %s -j DNAT --to-destination %s:%s"
+                % (protocol, external, repr(label), peer_ip, external)
+            )
+            apply_and_save(
+                ["iptables", "-t", "nat", "-A", "CLOUD_WG_SNAT",
+                 "-o", interface, "-d", peer_ip, "-p", protocol,
+                 "--dport", external, "-j", "MASQUERADE"],
+                "iptables -t nat -A CLOUD_WG_SNAT -o %s -d %s -p %s --dport %s -j MASQUERADE"
+                % (interface, peer_ip, protocol, external)
+            )
+            apply_and_save(
+                ["iptables", "-A", "CLOUD_WG_FORWARD",
+                 "-o", interface, "-d", peer_ip, "-p", protocol,
+                 "--dport", external,
+                 "-m", "conntrack", "--ctstate", "NEW,ESTABLISHED,RELATED",
+                 "-j", "ACCEPT"],
+                "iptables -A CLOUD_WG_FORWARD -o %s -d %s -p %s --dport %s -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT"
+                % (interface, peer_ip, protocol, external)
+            )
+            apply_and_save(
+                ["iptables", "-A", "CLOUD_WG_FORWARD",
+                 "-i", interface, "-s", peer_ip, "-p", protocol,
+                 "--sport", external,
+                 "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED",
+                 "-j", "ACCEPT"],
+                "iptables -A CLOUD_WG_FORWARD -i %s -s %s -p %s --sport %s -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
+                % (interface, peer_ip, protocol, external)
+            )
+
+    nat_dir = Path("/etc/cloud-wireguard")
+    nat_dir.mkdir(parents=True, exist_ok=True)
+    nat_script = nat_dir / "nat.sh"
+    temp_script = nat_dir / "nat.sh.tmp"
+    temp_script.write_text("\n".join(script) + "\n")
+    os.chmod(str(temp_script), 0o755)
+    os.replace(str(temp_script), str(nat_script))
+    return True
+
+
+def _parse_peer_blocks_from_text(text):
+    """Return raw Peer blocks with parsed identity fields."""
+    blocks = []
+    lines = text.splitlines()
+    index = 0
+
+    while index < len(lines):
+        if lines[index].strip() != "[Peer]":
+            index += 1
+            continue
+
+        start = index
+        index += 1
+        while index < len(lines) and lines[index].strip() not in ("[Peer]", "[Interface]"):
+            index += 1
+
+        raw_lines = lines[start:index]
+        block = {
+            "raw_lines": raw_lines,
+            "public_key": "",
+            "allowed_ips": [],
+            "managed": False,
+            "managed_id": "",
+        }
+
+        for raw in raw_lines:
+            line = raw.strip()
+            if line.startswith("# CLOUD-MANAGED-ID:"):
+                block["managed"] = True
+                block["managed_id"] = line.split(":", 1)[1].strip()
+            elif line.startswith("PublicKey") and "=" in line:
+                block["public_key"] = line.split("=", 1)[1].strip()
+            elif line.startswith("AllowedIPs") and "=" in line:
+                block["allowed_ips"] = [
+                    item.strip()
+                    for item in line.split("=", 1)[1].split(",")
+                    if item.strip()
+                ]
+
+        blocks.append(block)
+
+    return blocks
+
+
+def _read_existing_peer_blocks(config_path):
+    if not config_path.exists():
+        return []
+    return _parse_peer_blocks_from_text(config_path.read_text(errors="ignore"))
+
+
+def _peer_block_for_db_row(peer):
+    allowed = [peer["tunnel_ip"]]
+    allowed += clean_networks(peer["lan_ips"] or "")
+    return [
+        "[Peer]",
+        "# CLOUD-MANAGED-ID:%s" % peer["id"],
+        "# %s" % peer["name"],
+        "PublicKey = %s" % peer["public_key"],
+        "PresharedKey = %s" % peer["preshared_key"],
+        "AllowedIPs = %s" % ", ".join(allowed),
+        "PersistentKeepalive = 25",
+        "",
+    ]
+
+
+def _peer_count_from_text(text):
+    return sum(1 for line in text.splitlines() if line.strip() == "[Peer]")
+
+
+def _backup_wireguard_config(config_path):
+    if not config_path.exists():
+        return None
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup = config_path.with_name(config_path.name + ".panel-backup-" + stamp)
+    shutil.copy2(str(config_path), str(backup))
+    os.chmod(str(backup), 0o600)
+    return backup
+
+
+def _validate_wg_quick_config(path, interface):
+    # Ubuntu 18.04 wg-quick requires the filename itself to be a valid
+    # interface name followed by .conf.
+    validate_dir = Path(tempfile.mkdtemp(prefix="cloud-wg-validate-"))
+    validate_path = validate_dir / ("%s.conf" % interface)
+    try:
+        shutil.copy2(str(path), str(validate_path))
+        os.chmod(str(validate_path), 0o600)
+        proc = subprocess.run(
+            ["wg-quick", "strip", str(validate_path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                "ملف WireGuard الجديد غير صالح: %s"
+                % proc.stderr.decode(errors="ignore").strip()
+            )
+    finally:
+        shutil.rmtree(str(validate_dir), ignore_errors=True)
+
+
+def _find_recovery_peer_blocks(interface):
+    """Find peers from newest WireGuard backup when active config has none."""
+    candidates = []
+    patterns = [
+        "%s.conf.bak*" % interface,
+        "%s.conf.panel-backup-*" % interface,
+        "%s.conf.backup*" % interface,
+    ]
+    for pattern in patterns:
+        candidates.extend(WG_DIR.glob(pattern))
+
+    candidates = sorted(
+        {path for path in candidates if path.is_file()},
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+
+    for path in candidates:
+        try:
+            blocks = _read_existing_peer_blocks(path)
+        except Exception:
+            continue
+        if blocks:
+            return blocks, path
+    return [], None
+
+def ensure_server_keys(interface):
+    WG_DIR.mkdir(parents=True, exist_ok=True)
+    private_file = WG_DIR / ("%s.private" % interface)
+    public_file = WG_DIR / ("%s.public" % interface)
+    config_file = WG_DIR / ("%s.conf" % interface)
+
+    config_private = ""
+    if config_file.exists():
+        in_interface = False
+        for raw_line in config_file.read_text().splitlines():
+            line = raw_line.strip()
+            if line == "[Interface]":
+                in_interface = True
+                continue
+            if line.startswith("[") and line != "[Interface]":
+                in_interface = False
+            if in_interface and line.lower().startswith("privatekey") and "=" in line:
+                config_private = line.split("=", 1)[1].strip()
+                break
+
+    if config_private:
+        private_key = config_private
+        public_key = run(["wg", "pubkey"], input_text=private_key)
+        private_file.write_text(private_key + "\n")
+        public_file.write_text(public_key + "\n")
+        os.chmod(str(private_file), 0o600)
+        return private_key, public_key
+
+    if private_file.exists():
+        private_key = private_file.read_text().strip()
+        public_key = run(["wg", "pubkey"], input_text=private_key)
+        public_file.write_text(public_key + "\n")
+        return private_key, public_key
+
+    private_key, public_key, _ = wg_keypair()
+    private_file.write_text(private_key + "\n")
+    public_file.write_text(public_key + "\n")
+    os.chmod(str(private_file), 0o600)
+    return private_key, public_key
+
+
+def generate_server_config():
+    settings = get_settings()
+    interface = settings["interface"].strip()
+    server_private, _ = ensure_server_keys(interface)
+    config_path = WG_DIR / ("%s.conf" % interface)
+
+    con = db()
+    peers = con.execute(
+        "SELECT * FROM peers WHERE enabled=1 ORDER BY id"
+    ).fetchall()
+    con.close()
+
+    existing_blocks = _read_existing_peer_blocks(config_path)
+
+    # Safety recovery: if the active file was accidentally emptied and the DB
+    # also has no peers, recover candidates from the newest local backup.
+    recovered_from = None
+    if not existing_blocks and not peers:
+        recovery_blocks, recovery_path = _find_recovery_peer_blocks(interface)
+        if recovery_blocks:
+            existing_blocks = recovery_blocks
+            recovered_from = recovery_path
+
+    post_up = [
+        "sysctl -w net.ipv4.ip_forward=1",
+        "iptables -A FORWARD -i %i -j ACCEPT",
+        "iptables -A FORWARD -o %i -j ACCEPT",
+    ]
+    post_down = [
+        "iptables -D FORWARD -i %i -j ACCEPT",
+        "iptables -D FORWARD -o %i -j ACCEPT",
+    ]
+
+    out_interface = settings.get("out_interface", "").strip()
+    if out_interface:
+        post_up.append(
+            "iptables -t nat -A POSTROUTING -o %s -j MASQUERADE"
+            % out_interface
+        )
+        post_down.append(
+            "iptables -t nat -D POSTROUTING -o %s -j MASQUERADE"
+            % out_interface
+        )
+
+    lines = [
+        "[Interface]",
+        "Address = %s" % settings["address"],
+        "ListenPort = %s" % settings["port"],
+        "PrivateKey = %s" % server_private,
+        "MTU = %s" % settings.get("mtu", "1420"),
+        "PostUp = %s" % "; ".join(post_up),
+        "PostDown = %s" % "; ".join(post_down),
+        "",
+    ]
+
+    db_public_keys = {
+        (peer["public_key"] or "").strip()
+        for peer in peers
+        if (peer["public_key"] or "").strip()
+    }
+    db_ids = {str(peer["id"]) for peer in peers}
+
+    # Preserve every unmanaged peer that is not represented in the database.
+    # Managed peers removed from the DB are intentionally omitted.
+    for block in existing_blocks:
+        public_key = block.get("public_key", "")
+        managed_id = block.get("managed_id", "")
+        if public_key in db_public_keys:
+            continue
+        if block.get("managed") and managed_id not in db_ids:
+            continue
+        lines.extend(block["raw_lines"])
+        lines.append("")
+
+    # Add/update all DB-managed peers.
+    for peer in peers:
+        lines.extend(_peer_block_for_db_row(peer))
+
+    content = "\n".join(lines).rstrip() + "\n"
+    old_content = config_path.read_text(errors="ignore") if config_path.exists() else ""
+
+    # Refuse a silent destructive write. The only exception is when all old
+    # peers were explicitly managed and removed from the database.
+    old_blocks = _parse_peer_blocks_from_text(old_content)
+    old_unmanaged = [block for block in old_blocks if not block.get("managed")]
+    new_count = _peer_count_from_text(content)
+    if old_unmanaged and new_count == 0:
+        raise RuntimeError(
+            "تم إيقاف الحفظ لأن الملف الجديد كان سيحذف Peers موجودين"
+        )
+
+    WG_DIR.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(
+        prefix=interface + ".",
+        suffix=".conf",
+        dir=str(WG_DIR)
+    )
+    os.close(fd)
+    temp_path = Path(temp_name)
+
+    try:
+        temp_path.write_text(content)
+        os.chmod(str(temp_path), 0o600)
+        _validate_wg_quick_config(temp_path, interface)
+        _backup_wireguard_config(config_path)
+        os.replace(str(temp_path), str(config_path))
+        os.chmod(str(config_path), 0o600)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+    if recovered_from:
+        debug_path = APP_DIR / "sync-debug.log"
+        with debug_path.open("a") as handle:
+            handle.write(
+                "%s recovered peer blocks from %s\n"
+                % (
+                    datetime.now().isoformat(timespec="seconds"),
+                    recovered_from,
+                )
+            )
+
+    return config_path
+
+
+def apply_wireguard():
+    settings = get_settings()
+    interface = settings["interface"].strip()
+    config_path = generate_server_config()
+
+    run(["systemctl", "enable", "wg-quick@%s" % interface], check=False)
+    proc = subprocess.run(
+        ["systemctl", "restart", "wg-quick@%s" % interface],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "فشل تشغيل WireGuard بعد حفظ ملف صالح: %s"
+            % proc.stderr.decode(errors="ignore").strip()
+        )
+
+    # Confirm that the running interface contains every enabled DB peer.
+    live = subprocess.run(
+        ["wg", "show", interface, "dump"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE
+    )
+    if live.returncode != 0:
+        raise RuntimeError(
+            "WireGuard اشتغل لكن تعذر قراءة حالته: %s"
+            % live.stderr.decode(errors="ignore").strip()
+        )
+
+    regenerate_nat_rules()
+    return True
+
+
+def peer_config(peer):
+    settings = get_settings()
+    _, server_public = ensure_server_keys(settings["interface"])
+    return """[Interface]
+PrivateKey = {private_key}
+Address = {address}
+DNS = {dns}
+MTU = {mtu}
+
+[Peer]
+PublicKey = {server_public}
+PresharedKey = {psk}
+Endpoint = {endpoint}:{port}
+AllowedIPs = 0.0.0.0/0
+PersistentKeepalive = 25
+""".format(
+        private_key=peer["private_key"],
+        address=peer["tunnel_ip"],
+        dns=settings.get("dns", "1.1.1.1"),
+        mtu=settings.get("mtu", "1420"),
+        server_public=server_public,
+        psk=peer["preshared_key"],
+        endpoint=settings["endpoint"],
+        port=settings["port"],
+    )
+
+
+def ping_peer(tunnel_ip):
+    host = str(ipaddress.ip_interface(tunnel_ip).ip)
+    proc = subprocess.run(
+        ["ping", "-c", "4", "-W", "1", host],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE
+    )
+    output = proc.stdout.decode(errors="ignore")
+    loss = "100%"
+    latency = "-"
+    match = re.search(r"(\d+(?:\.\d+)?)% packet loss", output)
+    if match:
+        loss = match.group(1) + "%"
+    match = re.search(r"= [\d.]+/([\d.]+)/", output)
+    if match:
+        latency = match.group(1) + " ms"
+    return {
+        "online": proc.returncode == 0,
+        "loss": loss,
+        "latency": latency,
+        "output": output,
+    }
+
+
+def wireguard_peer_stats():
+    settings = get_settings()
+    stats = {}
+    try:
+        output = run(["wg", "show", settings["interface"], "dump"], check=False)
+        lines = output.splitlines()
+        for line in lines[1:]:
+            cols = line.split("\t")
+            if len(cols) >= 8:
+                public_key = cols[0]
+                latest = int(cols[4] or 0)
+                stats[public_key] = {
+                    "latest_handshake": latest,
+                    "handshake_text": datetime.fromtimestamp(latest).strftime("%Y-%m-%d %H:%M:%S") if latest else "-",
+                    "rx": int(cols[5] or 0),
+                    "tx": int(cols[6] or 0),
+                    "online": latest > 0 and (datetime.now().timestamp() - latest) < 180,
+                }
+    except Exception:
+        pass
+    return stats
+
+
+def human_bytes(value):
+    value = float(value or 0)
+    units = ["B", "KB", "MB", "GB", "TB"]
+    index = 0
+    while value >= 1024 and index < len(units) - 1:
+        value /= 1024.0
+        index += 1
+    return "%.1f %s" % (value, units[index])
+
+
+app.jinja_env.filters["human_bytes"] = human_bytes
+
+
+# ---------------- MikroTik API ----------------
+
+def _encode_length(length):
+    if length < 0x80:
+        return bytes([length])
+    if length < 0x4000:
+        length |= 0x8000
+        return struct.pack(">H", length)
+    if length < 0x200000:
+        length |= 0xC00000
+        return bytes([(length >> 16) & 0xFF, (length >> 8) & 0xFF, length & 0xFF])
+    if length < 0x10000000:
+        length |= 0xE0000000
+        return struct.pack(">I", length)
+    return b"\xF0" + struct.pack(">I", length)
+
+
+def _read_exact(sock, count):
+    data = b""
+    while len(data) < count:
+        chunk = sock.recv(count - len(data))
+        if not chunk:
+            raise RuntimeError("انقطع اتصال MikroTik API")
+        data += chunk
+    return data
+
+
+def _read_length(sock):
+    first = _read_exact(sock, 1)[0]
+    if (first & 0x80) == 0:
+        return first
+    if (first & 0xC0) == 0x80:
+        return ((first & ~0xC0) << 8) + _read_exact(sock, 1)[0]
+    if (first & 0xE0) == 0xC0:
+        b2 = _read_exact(sock, 2)
+        return ((first & ~0xE0) << 16) + (b2[0] << 8) + b2[1]
+    if (first & 0xF0) == 0xE0:
+        b3 = _read_exact(sock, 3)
+        return ((first & ~0xF0) << 24) + (b3[0] << 16) + (b3[1] << 8) + b3[2]
+    if first == 0xF0:
+        return struct.unpack(">I", _read_exact(sock, 4))[0]
+    raise RuntimeError("صيغة API غير صحيحة")
+
+
+class RouterOSAPI(object):
+    def __init__(self, host, port, username, password, use_ssl=False, timeout=7):
+        self.host = host
+        self.port = int(port)
+        self.username = username
+        self.password = password
+        self.use_ssl = bool(use_ssl)
+        self.timeout = timeout
+        self.sock = None
+
+    def connect(self):
+        raw = socket.create_connection((self.host, self.port), self.timeout)
+        if self.use_ssl:
+            context = ssl._create_unverified_context()
+            raw = context.wrap_socket(raw, server_hostname=self.host)
+        self.sock = raw
+        self.talk("/login", {
+            "name": self.username,
+            "password": self.password,
+        })
+        return self
+
+    def close(self):
+        try:
+            if self.sock:
+                self.sock.close()
+        finally:
+            self.sock = None
+
+    def write_sentence(self, words):
+        payload = b""
+        for word in words:
+            encoded = word.encode("utf-8")
+            payload += _encode_length(len(encoded)) + encoded
+        payload += b"\x00"
+        self.sock.sendall(payload)
+
+    def read_sentence(self):
+        words = []
+        while True:
+            length = _read_length(self.sock)
+            if length == 0:
+                return words
+            words.append(_read_exact(self.sock, length).decode("utf-8", errors="replace"))
+
+    def talk(self, command, attrs=None, queries=None):
+        words = [command]
+        for key, value in (attrs or {}).items():
+            words.append("=%s=%s" % (key, value))
+        for query in queries or []:
+            words.append(query)
+        self.write_sentence(words)
+
+        replies = []
+        while True:
+            sentence = self.read_sentence()
+            if not sentence:
+                continue
+            reply_type = sentence[0]
+            data = {}
+            message = ""
+            for word in sentence[1:]:
+                if word.startswith("="):
+                    parts = word[1:].split("=", 1)
+                    if len(parts) == 2:
+                        data[parts[0]] = parts[1]
+                elif word.startswith("=message="):
+                    message = word.split("=", 2)[2]
+            if reply_type == "!re":
+                replies.append(data)
+            elif reply_type == "!trap":
+                raise RuntimeError(data.get("message") or message or "MikroTik API error")
+            elif reply_type == "!done":
+                return replies
+
+    def find_one(self, command, queries):
+        rows = self.talk(command, queries=queries)
+        return rows[0] if rows else None
+
+
+def get_peer_or_404(peer_id):
+    con = db()
+    peer = con.execute("SELECT * FROM peers WHERE id=?", (peer_id,)).fetchone()
+    con.close()
+    return peer
+
+
+def connect_peer_api(peer):
+    password = decrypt_text(peer["mt_password_enc"])
+    if not peer["mt_host"] or not peer["mt_username"] or not password:
+        raise RuntimeError("أدخل IP واسم المستخدم وكلمة مرور MikroTik API أولاً")
+    return RouterOSAPI(
+        peer["mt_host"],
+        peer["mt_port"] or 8728,
+        peer["mt_username"],
+        password,
+        bool(peer["mt_ssl"]),
+    ).connect()
+
+
+
+
+def _subscriber_ipv4(value):
+    value = (value or "").strip()
+    if not value:
+        return ""
+    try:
+        address = ipaddress.ip_interface(value).ip if "/" in value else ipaddress.ip_address(value)
+    except Exception:
+        return ""
+    if address.version != 4:
+        return ""
+    if address.is_unspecified or address.is_loopback or address.is_multicast:
+        return ""
+    return str(address)
+
+
+def _best_subscriber_name(*values):
+    for value in values:
+        value = (value or "").strip()
+        if value and value not in ("0.0.0.0", "*", "unknown"):
+            return value
+    return ""
+
+
+def fetch_router_subscribers(peer_id):
+    """Return only currently connected subscribers with a stable identity.
+
+    PPPoE and Hotspot are matched by username. DHCP is matched by MAC.
+    An API failure never returns an empty list silently, preventing accidental
+    deletion of every subscriber when a router is temporarily unreachable.
+    """
+    peer = get_peer_or_404(peer_id)
+    if not peer:
+        raise RuntimeError("الوكيل غير موجود")
+
+    api = connect_peer_api(peer)
+    found = {}
+    successful_sources = 0
+    source_errors = []
+
+    def add(source, subscriber_key, priority, ip_value, name_value, extra=""):
+        ip_value = _subscriber_ipv4(ip_value)
+        subscriber_key = (subscriber_key or "").strip().lower()
+        if not ip_value or not subscriber_key:
+            return
+
+        name_value = _best_subscriber_name(
+            name_value, extra, ip_value
+        )
+        item = {
+            "key": subscriber_key,
+            "ip": ip_value,
+            "name": name_value,
+            "source": source,
+            "priority": int(priority),
+            "extra": (extra or "").strip(),
+        }
+
+        current = found.get(subscriber_key)
+        if current is None or item["priority"] > current["priority"]:
+            found[subscriber_key] = item
+        elif item["priority"] == current["priority"]:
+            if current["name"] == current["ip"] and item["name"] != item["ip"]:
+                found[subscriber_key] = item
+
+    try:
+        try:
+            rows = api.talk("/ppp/active/print")
+            successful_sources += 1
+            for row in rows:
+                username = (
+                    row.get("name") or row.get("user") or ""
+                ).strip()
+                add(
+                    "PPPoE",
+                    "pppoe:%s" % username.lower(),
+                    100,
+                    row.get("address") or row.get("remote-address"),
+                    username,
+                    row.get("caller-id") or row.get("service") or ""
+                )
+        except Exception as exc:
+            source_errors.append("PPPoE: %s" % exc)
+
+        try:
+            rows = api.talk("/ip/hotspot/active/print")
+            successful_sources += 1
+            for row in rows:
+                username = (
+                    row.get("user") or row.get("name") or ""
+                ).strip()
+                add(
+                    "Hotspot",
+                    "hotspot:%s" % username.lower(),
+                    95,
+                    row.get("address"),
+                    username,
+                    row.get("mac-address") or row.get("server") or ""
+                )
+        except Exception as exc:
+            source_errors.append("Hotspot: %s" % exc)
+
+        try:
+            rows = api.talk("/ip/dhcp-server/lease/print")
+            successful_sources += 1
+            for row in rows:
+                status = (row.get("status") or "").lower()
+                if status and status != "bound":
+                    continue
+
+                mac = (row.get("mac-address") or "").strip().lower()
+                host = (
+                    row.get("comment")
+                    or row.get("host-name")
+                    or mac
+                    or row.get("address")
+                    or ""
+                )
+                key_value = (
+                    "dhcp:%s" % mac
+                    if mac
+                    else "dhcp-ip:%s" % (row.get("address") or "")
+                )
+                add(
+                    "DHCP",
+                    key_value,
+                    85,
+                    row.get("address"),
+                    host,
+                    row.get("host-name") or mac
+                )
+        except Exception as exc:
+            source_errors.append("DHCP: %s" % exc)
+    finally:
+        api.close()
+
+    if successful_sources == 0:
+        raise RuntimeError(
+            "تعذر قراءة المشتركين المتصلين من MikroTik: "
+            + " | ".join(source_errors)
+        )
+
+    subscribers = list(found.values())
+    subscribers.sort(
+        key=lambda item: (
+            item["name"].lower(),
+            tuple(int(part) for part in item["ip"].split("."))
+        )
+    )
+    for item in subscribers:
+        item.pop("priority", None)
+    return subscribers
+
+
+def canonical_router_subscriber(peer_id, internal_ip):
+    internal_ip = normalize_internal_ip(internal_ip)
+    for item in fetch_router_subscribers(peer_id):
+        if item["ip"] == internal_ip:
+            return item
+    raise RuntimeError(
+        "هذا الـIP غير موجود ضمن مشتركي الراوتر المحدد؛ حدّث قائمة المشتركين"
+    )
+
+
+
+def import_all_router_subscribers(
+    default_internal_port=80,
+    protocol="tcp",
+    only_peer_id=None
+):
+    try:
+        default_internal_port = int(default_internal_port)
+    except Exception:
+        raise RuntimeError("البورت الداخلي الافتراضي غير صحيح")
+    if default_internal_port < 1 or default_internal_port > 65535:
+        raise RuntimeError("البورت الداخلي الافتراضي غير صحيح")
+
+    protocol = validate_forward_protocol(protocol)
+
+    con = db()
+    if only_peer_id is None:
+        peers = con.execute(
+            """
+            SELECT * FROM peers
+            WHERE enabled=1
+            ORDER BY name, id
+            """
+        ).fetchall()
+    else:
+        peers = con.execute(
+            """
+            SELECT * FROM peers
+            WHERE enabled=1 AND id=?
+            ORDER BY name, id
+            """,
+            (int(only_peer_id),)
+        ).fetchall()
+    con.close()
+
+    if not peers:
+        raise RuntimeError("لا يوجد أي راوتر فعال")
+
+    total_found = 0
+    total_added = 0
+    total_updated = 0
+    total_deleted = 0
+    changed_peer_ids = set()
+    router_results = []
+    discovery_errors = []
+
+    for peer in peers:
+        peer_id = int(peer["id"])
+        router_result = {
+            "peer_id": peer_id,
+            "peer_name": peer["name"],
+            "tunnel_ip": peer["tunnel_ip"],
+            "found": 0,
+            "added": 0,
+            "updated": 0,
+            "deleted": 0,
+            "error": "",
+        }
+
+        try:
+            # No deletion occurs unless this call succeeds.
+            subscribers = fetch_router_subscribers(peer_id)
+            router_result["found"] = len(subscribers)
+            total_found += len(subscribers)
+
+            con = db()
+            existing_rows = con.execute(
+                """
+                SELECT * FROM port_forwards
+                WHERE peer_id=?
+                ORDER BY id
+                """,
+                (peer_id,)
+            ).fetchall()
+
+            by_key = {
+                (row["subscriber_key"] or "").strip().lower(): row
+                for row in existing_rows
+                if (row["subscriber_key"] or "").strip()
+            }
+            unmatched = {int(row["id"]): row for row in existing_rows}
+            seen_keys = set()
+            stamp = datetime.now().isoformat(timespec="seconds")
+
+            for subscriber in subscribers:
+                subscriber_key = subscriber["key"].strip().lower()
+                internal_ip = normalize_internal_ip(subscriber["ip"])
+                name = (
+                    (subscriber.get("name") or "").strip()
+                    or internal_ip
+                )
+                source = (
+                    subscriber.get("source") or ""
+                ).strip()
+                seen_keys.add(subscriber_key)
+
+                existing = by_key.get(subscriber_key)
+
+                # Upgrade legacy v7.0 records by matching same username first,
+                # then same current IP. This preserves their public port.
+                if existing is None:
+                    lowered_name = name.lower()
+                    for candidate in list(unmatched.values()):
+                        if (
+                            (candidate["name"] or "").strip().lower()
+                            == lowered_name
+                        ):
+                            existing = candidate
+                            break
+
+                if existing is None:
+                    for candidate in list(unmatched.values()):
+                        if (
+                            (candidate["internal_ip"] or "").strip()
+                            == internal_ip
+                        ):
+                            existing = candidate
+                            break
+
+                if existing is not None:
+                    existing_id = int(existing["id"])
+                    unmatched.pop(existing_id, None)
+
+                    changed = (
+                        (existing["name"] or "") != name
+                        or (existing["internal_ip"] or "") != internal_ip
+                        or (existing["subscriber_key"] or "") != subscriber_key
+                        or (existing["subscriber_source"] or "") != source
+                        or int(existing["auto_managed"] or 0) != 1
+                        or int(existing["enabled"] or 0) != 1
+                    )
+
+                    con.execute(
+                        """
+                        UPDATE port_forwards
+                        SET name=?, internal_ip=?, subscriber_key=?,
+                            subscriber_source=?, auto_managed=1,
+                            enabled=1, last_seen_at=?, updated_at=?,
+                            last_error=''
+                        WHERE id=?
+                        """,
+                        (
+                            name,
+                            internal_ip,
+                            subscriber_key,
+                            source,
+                            stamp,
+                            stamp,
+                            existing_id,
+                        )
+                    )
+
+                    if changed:
+                        router_result["updated"] += 1
+                        total_updated += 1
+                        changed_peer_ids.add(peer_id)
+                    continue
+
+                external_port = next_forward_external_port()
+                con.execute(
+                    """
+                    INSERT INTO port_forwards
+                    (
+                        peer_id, name, internal_ip, internal_port,
+                        external_port, protocol, enabled,
+                        created_at, updated_at, last_applied_at, last_error,
+                        subscriber_key, subscriber_source,
+                        auto_managed, last_seen_at
+                    )
+                    VALUES(?,?,?,?,?,?,1,?,?,?,?,?,?,1,?)
+                    """,
+                    (
+                        peer_id,
+                        name,
+                        internal_ip,
+                        default_internal_port,
+                        external_port,
+                        protocol,
+                        stamp,
+                        stamp,
+                        "",
+                        "",
+                        subscriber_key,
+                        source,
+                        stamp,
+                    )
+                )
+
+                router_result["added"] += 1
+                total_added += 1
+                changed_peer_ids.add(peer_id)
+
+            # Delete users no longer present in active PPPoE/Hotspot/DHCP.
+            stale_ids = []
+            for row in existing_rows:
+                if int(row["auto_managed"] or 0) != 1:
+                    continue
+                key_value = (
+                    row["subscriber_key"] or ""
+                ).strip().lower()
+
+                # A matched legacy row was removed from unmatched above.
+                if int(row["id"]) not in unmatched:
+                    continue
+                if key_value and key_value in seen_keys:
+                    continue
+                stale_ids.append(int(row["id"]))
+
+            for stale_id in stale_ids:
+                con.execute(
+                    "DELETE FROM port_forwards WHERE id=?",
+                    (stale_id,)
+                )
+
+            if stale_ids:
+                router_result["deleted"] = len(stale_ids)
+                total_deleted += len(stale_ids)
+                changed_peer_ids.add(peer_id)
+
+            con.commit()
+            con.close()
+
+        except Exception as exc:
+            router_result["error"] = str(exc)
+            discovery_errors.append(
+                "%s: %s" % (peer["name"], exc)
+            )
+
+        router_results.append(router_result)
+
+    if changed_peer_ids:
+        regenerate_nat_rules()
+
+    apply_errors = []
+    for peer_id in sorted(changed_peer_ids):
+        try:
+            sync_peer_port_forwards(peer_id)
+        except Exception as exc:
+            apply_errors.append(
+                "الراوتر %s: %s" % (peer_id, exc)
+            )
+            con = db()
+            con.execute(
+                """
+                UPDATE port_forwards
+                SET last_error=?, updated_at=?
+                WHERE peer_id=?
+                """,
+                (
+                    str(exc)[:1000],
+                    datetime.now().isoformat(timespec="seconds"),
+                    peer_id,
+                )
+            )
+            con.commit()
+            con.close()
+
+    return {
+        "found": total_found,
+        "added": total_added,
+        "updated": total_updated,
+        "deleted": total_deleted,
+        "routers": router_results,
+        "discovery_errors": discovery_errors,
+        "apply_errors": apply_errors,
+    }
+
+
+SUBSCRIBER_SYNC_LOCK = threading.Lock()
+
+
+def _subscriber_sync_log(message):
+    try:
+        path = APP_DIR / "subscriber-sync.log"
+        with path.open("a") as handle:
+            handle.write(
+                "%s %s\n"
+                % (
+                    datetime.now().isoformat(timespec="seconds"),
+                    message,
+                )
+            )
+    except Exception:
+        pass
+
+
+def run_automatic_subscriber_sync():
+    if not SUBSCRIBER_SYNC_LOCK.acquire(False):
+        return None
+
+    try:
+        settings = get_settings()
+        if settings.get("subscriber_sync_enabled", "1") != "1":
+            return None
+
+        default_port = int(
+            settings.get("subscriber_default_port", "80") or 80
+        )
+        default_protocol = settings.get(
+            "subscriber_default_protocol", "tcp"
+        )
+
+        result = import_all_router_subscribers(
+            default_internal_port=default_port,
+            protocol=default_protocol,
+        )
+
+        _subscriber_sync_log(
+            "found=%s added=%s updated=%s deleted=%s errors=%s"
+            % (
+                result["found"],
+                result["added"],
+                result["updated"],
+                result["deleted"],
+                len(result["discovery_errors"])
+                + len(result["apply_errors"]),
+            )
+        )
+        return result
+    except Exception as exc:
+        _subscriber_sync_log("error=%s" % exc)
+        return None
+    finally:
+        SUBSCRIBER_SYNC_LOCK.release()
+
+
+
+WIREGUARD_AUTO_SYNC_LOCK = threading.Lock()
+
+
+def _wireguard_auto_sync_log(message):
+    try:
+        path = APP_DIR / "wireguard-auto-sync.log"
+        with path.open("a") as handle:
+            handle.write(
+                "%s %s\n"
+                % (
+                    datetime.now().isoformat(timespec="seconds"),
+                    message,
+                )
+            )
+    except Exception:
+        pass
+
+
+def run_automatic_wireguard_sync():
+    if not WIREGUARD_AUTO_SYNC_LOCK.acquire(False):
+        return None
+    try:
+        imported = import_peers_from_ubuntu()
+        regenerate_nat_rules()
+        _wireguard_auto_sync_log(
+            "imported=%s nat=ok" % imported
+        )
+        return imported
+    except Exception as exc:
+        _wireguard_auto_sync_log("error=%s" % exc)
+        return None
+    finally:
+        WIREGUARD_AUTO_SYNC_LOCK.release()
+
+
+def wireguard_auto_sync_loop():
+    time.sleep(10)
+    while True:
+        run_automatic_wireguard_sync()
+        time.sleep(30)
+
+
+def subscriber_sync_loop():
+    # Give WireGuard and the web service time to finish startup.
+    time.sleep(20)
+
+    while True:
+        run_automatic_subscriber_sync()
+
+        try:
+            settings = get_settings()
+            interval = int(
+                settings.get("subscriber_sync_seconds", "60") or 60
+            )
+        except Exception:
+            interval = 60
+
+        time.sleep(max(30, interval))
+
+
+def random_api_credentials():
+    username = "cwg_" + secrets.token_hex(4)
+    password = secrets.token_urlsafe(18)
+    return username, password
+
+
+def ensure_random_api_credentials(peer_id):
+    peer = get_peer_or_404(peer_id)
+    if not peer:
+        return None, None, None
+
+    current_password = decrypt_text(peer["mt_password_enc"])
+    current_username = peer["mt_username"] or ""
+
+    if current_username and current_password and int(peer["mt_port"] or 0) == 9494:
+        return peer, current_username, current_password
+
+    username, password = random_api_credentials()
+    con = db()
+    con.execute("""
+        UPDATE peers
+        SET mt_username=?, mt_password_enc=?, mt_port=9494, mt_ssl=0
+        WHERE id=?
+    """, (
+        username,
+        encrypt_text(password),
+        peer_id,
+    ))
+    con.commit()
+    con.close()
+    return get_peer_or_404(peer_id), username, password
+
+
+def mikrotik_api_bootstrap_script(peer, username, password):
+    settings = get_settings()
+    source_ip = str(ipaddress.ip_interface(settings["address"]).ip) + "/32"
+    group_name = "cloud-panel-api"
+
+    # Direct values instead of local variables so it can be pasted safely as one block.
+    return """# Cloud WG Panel - API bootstrap
+# Paste the whole block into MikroTik Terminal
+
+:if ([:len [/user/group find where name="{group}"]] = 0) do={{
+  /user/group add name="{group}" policy=read,write,policy,test,api,reboot,sensitive comment="Cloud WG Panel API group"
+}} else={{
+  /user/group set [find where name="{group}"] policy=read,write,policy,test,api,reboot,sensitive comment="Cloud WG Panel API group"
+}}
+
+:if ([:len [/user find where name="{username}"]] = 0) do={{
+  /user add name="{username}" password="{password}" group="{group}" comment="Managed by Cloud WG Panel"
+}} else={{
+  /user set [find where name="{username}"] password="{password}" group="{group}" disabled=no comment="Managed by Cloud WG Panel"
+}}
+
+/ip/service set [find where name="api"] port=9494 disabled=no address={source_ip}
+
+:put "Cloud API ready on port 9494"
+:put "Username: {username}"
+:put "Password: {password}"
+""".format(
+        group=group_name,
+        username=username,
+        password=password,
+        source_ip=source_ip,
+    )
+
+
+def router_overview(peer):
+    api = connect_peer_api(peer)
+    try:
+        identity_rows = api.talk("/system/identity/print")
+        resource_rows = api.talk("/system/resource/print")
+        interface_rows = api.talk("/interface/print")
+        address_rows = api.talk("/ip/address/print")
+        service_rows = api.talk("/ip/service/print")
+        route_rows = api.talk("/ip/route/print")
+        identity = identity_rows[0] if identity_rows else {}
+        resource = resource_rows[0] if resource_rows else {}
+        interfaces = []
+        for item in interface_rows:
+            interfaces.append({
+                "name": item.get("name", "-"),
+                "type": item.get("type", "-"),
+                "running": item.get("running", "false") == "true",
+                "disabled": item.get("disabled", "false") == "true",
+                "mtu": item.get("actual-mtu", item.get("mtu", "-")),
+                "mac": item.get("mac-address", "-"),
+            })
+        addresses = []
+        for item in address_rows:
+            addresses.append({
+                "address": item.get("address", "-"),
+                "network": item.get("network", "-"),
+                "interface": item.get("interface", "-"),
+                "disabled": item.get("disabled", "false") == "true",
+                "comment": item.get("comment", ""),
+            })
+        services = []
+        for item in service_rows:
+            services.append({
+                "name": item.get("name", "-"),
+                "port": item.get("port", "-"),
+                "address": item.get("address", ""),
+                "disabled": item.get("disabled", "false") == "true",
+            })
+        active_routes = sum(
+            1 for item in route_rows
+            if item.get("active", "false") == "true" and item.get("disabled", "false") != "true"
+        )
+        return {
+            "identity": identity.get("name", "-"),
+            "version": resource.get("version", "-"),
+            "uptime": resource.get("uptime", "-"),
+            "architecture": resource.get("architecture-name", "-"),
+            "board": resource.get("board-name", "-"),
+            "cpu": resource.get("cpu", "-"),
+            "cpu_count": resource.get("cpu-count", "-"),
+            "cpu_load": resource.get("cpu-load", "0"),
+            "free_memory": resource.get("free-memory", "-"),
+            "total_memory": resource.get("total-memory", "-"),
+            "free_hdd": resource.get("free-hdd-space", "-"),
+            "interfaces": interfaces,
+            "addresses": addresses,
+            "services": services,
+            "active_routes": active_routes,
+        }
+    finally:
+        api.close()
+
+
+def provision_mikrotik_management(peer, managed_username, managed_password, target_port=9494):
+    if not managed_username:
+        raise RuntimeError("اسم مستخدم الإدارة مطلوب")
+    if len(managed_password) < 8:
+        raise RuntimeError("كلمة مرور الإدارة يجب أن تكون 8 أحرف على الأقل")
+    api = connect_peer_api(peer)
+    try:
+        group_name = "cloud-panel-api"
+        policies = "read,write,policy,test,api,reboot,sensitive"
+        group = api.find_one("/user/group/print", ["?name=%s" % group_name])
+        attrs = {"name": group_name, "policy": policies, "comment": "Cloud WG Panel API group"}
+        if group:
+            attrs[".id"] = group[".id"]
+            api.talk("/user/group/set", attrs)
+        else:
+            api.talk("/user/group/add", attrs)
+        user = api.find_one("/user/print", ["?name=%s" % managed_username])
+        attrs = {
+            "name": managed_username,
+            "password": managed_password,
+            "group": group_name,
+            "disabled": "no",
+            "comment": "Managed by Cloud WG Panel",
+        }
+        if user:
+            attrs[".id"] = user[".id"]
+            api.talk("/user/set", attrs)
+        else:
+            api.talk("/user/add", attrs)
+        service = api.find_one("/ip/service/print", ["?name=api"])
+        if not service:
+            raise RuntimeError("خدمة API غير موجودة")
+        source = str(ipaddress.ip_interface(get_settings()["address"]).ip) + "/32"
+        api.talk("/ip/service/set", {
+            ".id": service[".id"],
+            "port": str(int(target_port)),
+            "disabled": "no",
+            "address": source,
+        })
+    finally:
+        api.close()
+    con = db()
+    con.execute(
+        "UPDATE peers SET mt_port=?, mt_username=?, mt_password_enc=?, mt_ssl=0 WHERE id=?",
+        (int(target_port), managed_username, encrypt_text(managed_password), peer["id"])
+    )
+    con.commit()
+    con.close()
+    updated = get_peer_or_404(peer["id"])
+    verify = connect_peer_api(updated)
+    try:
+        identity = verify.talk("/system/identity/print")
+        resource = verify.talk("/system/resource/print")
+        return {
+            "identity": identity[0].get("name", "-") if identity else "-",
+            "version": resource[0].get("version", "-") if resource else "-",
+            "port": int(target_port),
+            "username": managed_username,
+        }
+    finally:
+        verify.close()
+
+def apply_mikrotik_api(peer):
+    settings = get_settings()
+    _, server_public = ensure_server_keys(settings["interface"])
+    api = connect_peer_api(peer)
+    try:
+        wg_name = "wg-cloud"
+
+        interface = api.find_one(
+            "/interface/wireguard/print",
+            ["?name=%s" % wg_name]
+        )
+        interface_attrs = {
+            "name": wg_name,
+            "private-key": peer["private_key"],
+            "mtu": settings.get("mtu", "1420"),
+            "disabled": "no",
+            "comment": "Cloud WireGuard",
+        }
+        if interface:
+            interface_attrs[".id"] = interface[".id"]
+            api.talk("/interface/wireguard/set", interface_attrs)
+        else:
+            api.talk("/interface/wireguard/add", interface_attrs)
+
+        address = api.find_one(
+            "/ip/address/print",
+            ["?interface=%s" % wg_name, "?comment=Cloud WireGuard"]
+        )
+        address_attrs = {
+            "address": peer["tunnel_ip"],
+            "interface": wg_name,
+            "disabled": "no",
+            "comment": "Cloud WireGuard",
+        }
+        if address:
+            address_attrs[".id"] = address[".id"]
+            api.talk("/ip/address/set", address_attrs)
+        else:
+            api.talk("/ip/address/add", address_attrs)
+
+        server_ip = str(ipaddress.ip_interface(settings["address"]).ip) + "/32"
+        remote_peer = api.find_one(
+            "/interface/wireguard/peers/print",
+            ["?interface=%s" % wg_name, "?comment=Cloud Server"]
+        )
+        peer_attrs = {
+            "interface": wg_name,
+            "public-key": server_public,
+            "preshared-key": peer["preshared_key"],
+            "endpoint-address": settings["endpoint"],
+            "endpoint-port": settings["port"],
+            "allowed-address": server_ip,
+            "persistent-keepalive": "25",
+            "disabled": "no",
+            "comment": "Cloud Server",
+        }
+        if remote_peer:
+            peer_attrs[".id"] = remote_peer[".id"]
+            api.talk("/interface/wireguard/peers/set", peer_attrs)
+        else:
+            api.talk("/interface/wireguard/peers/add", peer_attrs)
+
+        identity = api.talk("/system/identity/print")
+        resource = api.talk("/system/resource/print")
+        return {
+            "identity": identity[0].get("name", "-") if identity else "-",
+            "version": resource[0].get("version", "-") if resource else "-",
+        }
+    finally:
+        api.close()
+
+
+def mikrotik_script(peer):
+    settings = get_settings()
+    _, server_public = ensure_server_keys(settings["interface"])
+    server_ip = str(ipaddress.ip_interface(settings["address"]).ip) + "/32"
+    api_username = peer["mt_username"] or ""
+    api_password = decrypt_text(peer["mt_password_enc"])
+    winbox_internal = int(peer["winbox_internal"] or 8291)
+
+    return """# Cloud WG Panel - MikroTik RouterOS 7 Setup
+# انسخ السكربت كله والصقه دفعة واحدة داخل Terminal
+
+:if ([:len [/interface/wireguard find where name="wg-cloud"]] = 0) do={{
+  /interface/wireguard add name="wg-cloud" private-key="{private}" mtu={mtu} comment="Cloud WireGuard"
+}} else={{
+  /interface/wireguard set [find where name="wg-cloud"] private-key="{private}" mtu={mtu} disabled=no comment="Cloud WireGuard"
+}}
+
+:if ([:len [/ip/address find where interface="wg-cloud" and comment="Cloud WireGuard"]] = 0) do={{
+  /ip/address add address={address} interface="wg-cloud" comment="Cloud WireGuard"
+}} else={{
+  /ip/address set [find where interface="wg-cloud" and comment="Cloud WireGuard"] address={address} disabled=no
+}}
+
+:if ([:len [/interface/wireguard/peers find where interface="wg-cloud" and comment="Cloud Server"]] = 0) do={{
+  /interface/wireguard/peers add interface="wg-cloud" public-key="{server_public}" preshared-key="{psk}" endpoint-address={endpoint} endpoint-port={port} allowed-address={server_ip} persistent-keepalive=25 comment="Cloud Server"
+}} else={{
+  /interface/wireguard/peers set [find where interface="wg-cloud" and comment="Cloud Server"] public-key="{server_public}" preshared-key="{psk}" endpoint-address={endpoint} endpoint-port={port} allowed-address={server_ip} persistent-keepalive=25 disabled=no
+}}
+
+:if ([:len [/user/group find where name="cloud-panel-api"]] = 0) do={{
+  /user/group add name="cloud-panel-api" policy=read,write,policy,test,api,reboot,sensitive comment="Cloud WG Panel API"
+}} else={{
+  /user/group set [find where name="cloud-panel-api"] policy=read,write,policy,test,api,reboot,sensitive comment="Cloud WG Panel API"
+}}
+
+:if ([:len [/user find where name="{api_username}"]] = 0) do={{
+  /user add name="{api_username}" password="{api_password}" group="cloud-panel-api" comment="Cloud WG Panel API"
+}} else={{
+  /user set [find where name="{api_username}"] password="{api_password}" group="cloud-panel-api" disabled=no comment="Cloud WG Panel API"
+}}
+
+:local apiId [/ip/service find where name="api"]
+:if ([:len $apiId] > 0) do={ /ip/service set $apiId port=9494 disabled=no address={server_ip} }
+:local winboxId [/ip/service find where name="winbox"]
+:if ([:len $winboxId] > 0) do={ /ip/service set $winboxId port={winbox_internal} disabled=no }
+
+:put "Cloud WireGuard and API configuration completed"
+:put "WireGuard IP: {address}"
+:put "API User: {api_username}"
+:put "API Port: 9494"
+""".format(
+        private=peer["private_key"],
+        mtu=settings.get("mtu", "1420"),
+        address=peer["tunnel_ip"],
+        server_public=server_public,
+        psk=peer["preshared_key"],
+        endpoint=settings["endpoint"],
+        port=settings["port"],
+        server_ip=server_ip,
+        api_username=api_username,
+        api_password=api_password,
+        winbox_internal=winbox_internal,
+    )
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if session.get("user_id"):
+        return redirect(url_for("dashboard"))
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+        con = db()
+        user = con.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+        con.close()
+        if user and check_password_hash(user["password_hash"], password):
+            session.clear()
+            session["user_id"] = user["id"]
+            session["username"] = user["username"]
+            return redirect(url_for("dashboard"))
+        flash("اسم المستخدم أو كلمة المرور غير صحيحة", "danger")
+    return render_template("login.html", settings=get_settings())
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+
+@app.route("/")
+@login_required
+def dashboard():
+    try:
+        import_peers_from_ubuntu()
+    except Exception:
+        pass
+    con = db()
+    rows = con.execute("SELECT * FROM peers ORDER BY id DESC").fetchall()
+    con.close()
+    stats = wireguard_peer_stats()
+    total = len(rows)
+    online = sum(1 for row in rows if stats.get(row["public_key"], {}).get("online"))
+    rx = sum(stats.get(row["public_key"], {}).get("rx", 0) for row in rows)
+    tx = sum(stats.get(row["public_key"], {}).get("tx", 0) for row in rows)
+    peers = []
+    for row in rows[:8]:
+        item = dict(row)
+        item["wg"] = stats.get(item["public_key"], {
+            "handshake_text": "-", "rx": 0, "tx": 0, "online": False
+        })
+        peers.append(item)
+    return render_template(
+        "dashboard.html",
+        peers=peers,
+        total=total,
+        online=online,
+        offline=total-online,
+        rx=rx,
+        tx=tx,
+        settings=get_settings(),
+    )
+
+
+@app.route("/wireguard")
+@login_required
+def wireguard_page():
+    con = db()
+    rows = con.execute("SELECT * FROM peers ORDER BY id DESC").fetchall()
+    con.close()
+    stats = wireguard_peer_stats()
+    peers = []
+    for row in rows:
+        item = dict(row)
+        item["wg"] = stats.get(item["public_key"], {
+            "handshake_text": "-", "rx": 0, "tx": 0, "online": False
+        })
+        try:
+            item["health"] = ping_peer(item["tunnel_ip"])
+        except Exception:
+            item["health"] = {"online": False, "loss": "100%", "latency": "-"}
+        peers.append(item)
+    return render_template("wireguard.html", peers=peers, settings=get_settings())
+
+
+
+@app.route("/wireguard/sync-ubuntu", methods=["POST"])
+@login_required
+def sync_ubuntu_peers():
+    try:
+        count = import_peers_from_ubuntu()
+        regenerate_nat_rules()
+        if count:
+            flash("تم استيراد %s وكيل جديد وتحديث NAT" % count, "success")
+        else:
+            flash("تمت مزامنة Ubuntu وتحديث الوكلاء وقواعد NAT", "success")
+    except Exception as exc:
+        flash("فشلت مزامنة Ubuntu: %s" % exc, "danger")
+    return redirect(url_for("wireguard_page"))
+
+
+@app.route("/wireguard/sync-log")
+@login_required
+def sync_log():
+    path = APP_DIR / "sync-debug.log"
+    text = path.read_text(errors="ignore") if path.exists() else "No sync log yet"
+    return "<pre style='direction:ltr;text-align:left;white-space:pre-wrap'>%s</pre>" % text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+@app.route("/settings", methods=["POST"])
+@login_required
+def save_settings():
+    fields = ["interface", "endpoint", "port", "address", "dns", "mtu", "out_interface", "system_name"]
+    values = {key: request.form.get(key, "").strip() for key in fields}
+    try:
+        ipaddress.ip_interface(values["address"])
+        port = int(values["port"])
+        if port < 1 or port > 65535:
+            raise ValueError()
+    except Exception:
+        flash("إعدادات WireGuard غير صحيحة", "danger")
+        return redirect(url_for("wireguard_page"))
+
+    con = db()
+    for key, value in values.items():
+        con.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (key, value))
+    con.commit()
+    con.close()
+    flash("تم حفظ الإعدادات", "success")
+    return redirect(url_for("wireguard_page"))
+
+
+@app.route("/wireguard/apply", methods=["POST"])
+@login_required
+def apply():
+    try:
+        apply_wireguard()
+        flash("تمت مزامنة WireGuard بنجاح", "success")
+    except Exception as exc:
+        flash("فشل التطبيق: %s" % exc, "danger")
+    return redirect(url_for("wireguard_page"))
+
+
+@app.route("/peers/add", methods=["POST"])
+@login_required
+def add_peer():
+    con = None
+    peer_id = None
+    try:
+        name = request.form.get("name", "").strip()
+        if not name:
+            raise ValueError("اسم الوكيل مطلوب")
+
+        tunnel_ip = next_tunnel_ip()
+        winbox_internal = int(request.form.get("winbox_internal", "8291") or 8291)
+        requested_external = request.form.get("winbox_external", "").strip()
+        winbox_external = int(requested_external) if requested_external else next_winbox_port()
+        if winbox_external < 1 or winbox_external > 65535:
+            raise ValueError("بورت WinBox الخارجي غير صحيح")
+
+        lan_ips = request.form.get("lan_ips", "").strip()
+        clean_networks(lan_ips)
+        private_key, public_key, psk = wg_keypair()
+        api_username, api_password = random_api_credentials()
+        mt_host = str(ipaddress.ip_interface(tunnel_ip).ip)
+
+        con = db()
+        if con.execute("SELECT 1 FROM peers WHERE winbox_external=?", (winbox_external,)).fetchone():
+            raise ValueError("بورت WinBox الخارجي مستخدم من وكيل آخر")
+        con.execute("""
+            INSERT INTO peers
+            (name,tunnel_ip,lan_ips,public_ips,private_key,public_key,preshared_key,enabled,notes,
+             mt_host,mt_port,mt_username,mt_password_enc,mt_ssl,winbox_internal,winbox_external)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            name, tunnel_ip, lan_ips,
+            request.form.get("public_ips", "").strip(),
+            private_key, public_key, psk, 1,
+            request.form.get("notes", "").strip(),
+            mt_host, 9494, api_username, encrypt_text(api_password), 0,
+            winbox_internal, winbox_external,
+        ))
+        peer_id = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+        con.commit(); con.close(); con = None
+
+        # Automatically writes wg-cloud0.conf, restarts WireGuard, and creates WinBox NAT.
+        apply_wireguard()
+        flash("تمت إضافة الوكيل تلقائياً. WinBox: %s:%s" % (get_settings()["endpoint"], winbox_external), "success")
+        return redirect(url_for("wireguard_page"))
+    except sqlite3.IntegrityError:
+        if con: con.rollback(); con.close()
+        flash("حدث تكرار في IP أو بورت WinBox", "danger")
+    except Exception as exc:
+        if con: con.rollback(); con.close()
+        if peer_id:
+            cleanup = db(); cleanup.execute("DELETE FROM peers WHERE id=?", (peer_id,)); cleanup.commit(); cleanup.close()
+            try: apply_wireguard()
+            except Exception: pass
+        flash("تعذر إضافة الوكيل: %s" % exc, "danger")
+    return redirect(url_for("wireguard_page"))
+
+
+@app.route("/peers/<int:peer_id>/edit", methods=["GET", "POST"])
+@login_required
+def edit_peer(peer_id):
+    con = db()
+    peer = con.execute("SELECT * FROM peers WHERE id=?", (peer_id,)).fetchone()
+    if not peer:
+        con.close()
+        return "Not found", 404
+
+    if request.method == "POST":
+        try:
+            tunnel_ip = request.form.get("tunnel_ip", "").strip()
+            ipaddress.ip_interface(tunnel_ip)
+            lan_ips = request.form.get("lan_ips", "").strip()
+            clean_networks(lan_ips)
+            old_password = peer["mt_password_enc"]
+            new_password = request.form.get("mt_password", "")
+            password_enc = encrypt_text(new_password) if new_password else old_password
+            requested_external = int(request.form.get("winbox_external", "0") or 0)
+            validate_external_port(requested_external, peer_id)
+            con.execute("""
+                UPDATE peers SET
+                    name=?, tunnel_ip=?, lan_ips=?, public_ips=?, notes=?,
+                    mt_host=?, mt_port=?, mt_username=?, mt_password_enc=?, mt_ssl=?,
+                    winbox_internal=?, winbox_external=?
+                WHERE id=?
+            """, (
+                request.form.get("name", "").strip(),
+                tunnel_ip,
+                lan_ips,
+                request.form.get("public_ips", "").strip(),
+                request.form.get("notes", "").strip(),
+                request.form.get("mt_host", "").strip(),
+                int(request.form.get("mt_port", "8728") or 8728),
+                request.form.get("mt_username", "").strip(),
+                password_enc,
+                1 if request.form.get("mt_ssl") else 0,
+                int(request.form.get("winbox_internal", "8291") or 8291),
+                requested_external,
+                peer_id,
+            ))
+            con.commit()
+            con.close()
+            apply_wireguard()
+            flash("تم تعديل الوكيل وتحديث WireGuard وWinBox NAT تلقائياً", "success")
+            return redirect(url_for("wireguard_page"))
+        except Exception as exc:
+            flash("فشل التعديل: %s" % exc, "danger")
+    con.close()
+    return render_template("edit_peer.html", peer=peer, settings=get_settings())
+
+
+@app.route("/peers/<int:peer_id>/api-test", methods=["POST"])
+@login_required
+def api_test(peer_id):
+    peer = get_peer_or_404(peer_id)
+    if not peer:
+        return "Not found", 404
+    try:
+        api = connect_peer_api(peer)
+        try:
+            identity = api.talk("/system/identity/print")
+            resource = api.talk("/system/resource/print")
+            name = identity[0].get("name", "-") if identity else "-"
+            version = resource[0].get("version", "-") if resource else "-"
+            uptime = resource[0].get("uptime", "-") if resource else "-"
+            flash("اتصال MikroTik ناجح: %s | RouterOS %s | %s" % (name, version, uptime), "success")
+        finally:
+            api.close()
+    except Exception as exc:
+        flash("فشل اتصال MikroTik API: %s" % exc, "danger")
+    return redirect(url_for("edit_peer", peer_id=peer_id))
+
+
+@app.route("/peers/<int:peer_id>/api-apply", methods=["POST"])
+@login_required
+def api_apply(peer_id):
+    peer = get_peer_or_404(peer_id)
+    if not peer:
+        return "Not found", 404
+    try:
+        result = apply_mikrotik_api(peer)
+        flash(
+            "تم تطبيق WireGuard على MikroTik عبر API: %s | RouterOS %s" %
+            (result["identity"], result["version"]),
+            "success"
+        )
+    except Exception as exc:
+        flash("فشل تطبيق MikroTik API: %s" % exc, "danger")
+    return redirect(url_for("edit_peer", peer_id=peer_id))
+
+
+
+@app.route("/peers/<int:peer_id>/scripts")
+@login_required
+def peer_scripts(peer_id):
+    return redirect(url_for("wireguard_page"))
+
+
+@app.route("/peers/<int:peer_id>/scripts/regenerate", methods=['POST'])
+@login_required
+def regenerate_api_credentials(peer_id):
+    return redirect(url_for("wireguard_page"))
+
+
+@app.route("/routers/<int:peer_id>")
+@login_required
+def router_manage(peer_id):
+    peer = get_peer_or_404(peer_id)
+    if not peer:
+        return "Not found", 404
+    try:
+        router = router_overview(peer)
+        error = None
+    except Exception as exc:
+        router = None
+        error = str(exc)
+    return render_template("router_manage.html", peer=peer, router=router, error=error, settings=get_settings())
+
+
+@app.route("/routers/<int:peer_id>/provision", methods=["POST"])
+@login_required
+def router_provision(peer_id):
+    peer = get_peer_or_404(peer_id)
+    if not peer:
+        return "Not found", 404
+    try:
+        username = request.form.get("managed_username", "").strip()
+        password = request.form.get("managed_password", "")
+        if not username or not password:
+            username, password = random_api_credentials()
+        result = provision_mikrotik_management(peer, username, password, 9494)
+        flash("تم إنشاء مستخدم الإدارة %s وتغيير API إلى 9494 على %s" %
+              (result["username"], result["identity"]), "success")
+    except Exception as exc:
+        flash("فشلت تهيئة إدارة MikroTik: %s" % exc, "danger")
+    return redirect(url_for("edit_peer", peer_id=peer_id))
+
+
+@app.route("/routers/<int:peer_id>/identity", methods=["POST"])
+@login_required
+def router_set_identity(peer_id):
+    peer = get_peer_or_404(peer_id)
+    if not peer:
+        return "Not found", 404
+    name = request.form.get("identity", "").strip()
+    if not name:
+        flash("اسم الراوتر مطلوب", "danger")
+        return redirect(url_for("router_manage", peer_id=peer_id))
+    try:
+        api = connect_peer_api(peer)
+        try:
+            api.talk("/system/identity/set", {"name": name})
+        finally:
+            api.close()
+        flash("تم تغيير اسم الراوتر", "success")
+    except Exception as exc:
+        flash("فشل تغيير الاسم: %s" % exc, "danger")
+    return redirect(url_for("router_manage", peer_id=peer_id))
+
+
+@app.route("/routers/<int:peer_id>/service", methods=["POST"])
+@login_required
+def router_set_service(peer_id):
+    peer = get_peer_or_404(peer_id)
+    if not peer:
+        return "Not found", 404
+    service_name = request.form.get("service_name", "").strip()
+    action = request.form.get("action", "").strip()
+    try:
+        api = connect_peer_api(peer)
+        try:
+            service = api.find_one("/ip/service/print", ["?name=%s" % service_name])
+            if not service:
+                raise RuntimeError("الخدمة غير موجودة")
+            api.talk("/ip/service/set", {
+                ".id": service[".id"],
+                "disabled": "no" if action == "enable" else "yes",
+            })
+        finally:
+            api.close()
+        flash("تم تحديث خدمة %s" % service_name, "success")
+    except Exception as exc:
+        flash("فشل تحديث الخدمة: %s" % exc, "danger")
+    return redirect(url_for("router_manage", peer_id=peer_id))
+
+
+@app.route("/routers/<int:peer_id>/reboot", methods=["POST"])
+@login_required
+def router_reboot(peer_id):
+    peer = get_peer_or_404(peer_id)
+    if not peer:
+        return "Not found", 404
+    try:
+        api = connect_peer_api(peer)
+        try:
+            api.talk("/system/reboot")
+        finally:
+            api.close()
+        flash("تم إرسال أمر إعادة التشغيل", "success")
+    except Exception as exc:
+        if "انقطع اتصال" in str(exc):
+            flash("تم إرسال أمر إعادة التشغيل", "success")
+        else:
+            flash("فشل إعادة التشغيل: %s" % exc, "danger")
+    return redirect(url_for("router_manage", peer_id=peer_id))
+
+
+
+@app.route("/api/peers/<int:peer_id>/subscribers")
+@login_required
+def peer_subscribers_api(peer_id):
+    try:
+        peer = get_peer_or_404(peer_id)
+        if not peer:
+            return jsonify({
+                "ok": False,
+                "error": "الوكيل غير موجود",
+                "subscribers": [],
+            }), 404
+
+        subscribers = fetch_router_subscribers(peer_id)
+        return jsonify({
+            "ok": True,
+            "peer": {
+                "id": peer["id"],
+                "name": peer["name"],
+                "tunnel_ip": peer["tunnel_ip"],
+            },
+            "count": len(subscribers),
+            "subscribers": subscribers,
+        })
+    except Exception as exc:
+        return jsonify({
+            "ok": False,
+            "error": str(exc),
+            "subscribers": [],
+        }), 500
+
+
+@app.route("/port-forwards")
+@login_required
+def port_forwards_page():
+    con = db()
+    peers = con.execute(
+        """
+        SELECT id,name,tunnel_ip,enabled
+        FROM peers
+        ORDER BY name, id
+        """
+    ).fetchall()
+    forwards = con.execute(
+        """
+        SELECT pf.*, p.name AS peer_name, p.tunnel_ip
+        FROM port_forwards pf
+        JOIN peers p ON p.id=pf.peer_id
+        ORDER BY p.name, pf.external_port, pf.id
+        """
+    ).fetchall()
+    con.close()
+
+    grouped = []
+    by_peer = {}
+    for peer in peers:
+        group = {
+            "peer": peer,
+            "forwards": [],
+        }
+        grouped.append(group)
+        by_peer[int(peer["id"])] = group
+
+    for item in forwards:
+        peer_id = int(item["peer_id"])
+        group = by_peer.get(peer_id)
+        if group is None:
+            continue
+        group["forwards"].append(item)
+
+    return render_template(
+        "port_forwards.html",
+        peers=peers,
+        forwards=forwards,
+        router_groups=grouped,
+        settings=get_settings(),
+    )
+
+
+@app.route("/port-forwards/import-all", methods=["POST"])
+@login_required
+def port_forward_import_all():
+    try:
+        internal_port = int(
+            request.form.get("internal_port", "80") or 80
+        )
+        protocol = validate_forward_protocol(
+            request.form.get("protocol", "tcp")
+        )
+
+        result = import_all_router_subscribers(
+            default_internal_port=internal_port,
+            protocol=protocol,
+        )
+
+        message = (
+            "تم فحص %(found)s مشترك متصل؛ إضافة %(added)s جديد، "
+            "تحديث %(updated)s، وحذف %(deleted)s غير متصل"
+        ) % result
+
+        all_errors = (
+            result["discovery_errors"] + result["apply_errors"]
+        )
+        if all_errors:
+            flash(
+                message + " — بعض الراوترات بيها خطأ: "
+                + " | ".join(all_errors),
+                "danger"
+            )
+        else:
+            flash(message + "، وتم عزلهم حسب كل راوتر", "success")
+
+    except Exception as exc:
+        flash("فشل إضافة كل المشتركين: %s" % exc, "danger")
+
+    return redirect(url_for("port_forwards_page"))
+
+
+
+@app.route("/port-forwards/router/<int:peer_id>")
+@login_required
+def router_subscribers_page(peer_id):
+    peer = get_peer_or_404(peer_id)
+    if not peer:
+        return "Not found", 404
+
+    con = db()
+    forwards = con.execute(
+        """
+        SELECT pf.*, p.name AS peer_name, p.tunnel_ip
+        FROM port_forwards pf
+        JOIN peers p ON p.id=pf.peer_id
+        WHERE pf.peer_id=?
+        ORDER BY pf.external_port, pf.name, pf.id
+        """,
+        (int(peer_id),)
+    ).fetchall()
+    con.close()
+
+    return render_template(
+        "router_subscribers.html",
+        peer=peer,
+        forwards=forwards,
+        settings=get_settings(),
+    )
+
+
+@app.route("/port-forwards/router/<int:peer_id>/sync", methods=["POST"])
+@login_required
+def router_subscribers_sync(peer_id):
+    peer = get_peer_or_404(peer_id)
+    if not peer:
+        return "Not found", 404
+
+    try:
+        settings = get_settings()
+        result = import_all_router_subscribers(
+            default_internal_port=int(
+                settings.get("subscriber_default_port", "80") or 80
+            ),
+            protocol=settings.get(
+                "subscriber_default_protocol", "tcp"
+            ),
+            only_peer_id=peer_id,
+        )
+        flash(
+            "تمت مزامنة %s: متصلون %(found)s، إضافة %(added)s، "
+            "تحديث %(updated)s، حذف %(deleted)s"
+            % peer["name"] % result,
+            "success"
+        )
+    except Exception as exc:
+        flash(
+            "فشلت مزامنة الراوتر %s: %s"
+            % (peer["name"], exc),
+            "danger"
+        )
+
+    return redirect(
+        url_for("router_subscribers_page", peer_id=peer_id)
+    )
+
+
+
+@app.route("/port-forwards/add", methods=["POST"])
+@login_required
+def port_forward_add():
+    forward_id = None
+    peer_id = None
+    try:
+        peer_id = int(request.form.get("peer_id", "0") or 0)
+        peer = get_peer_or_404(peer_id)
+        if not peer:
+            raise RuntimeError("اختر وكيل صحيح")
+
+        internal_ip = normalize_internal_ip(request.form.get("internal_ip", ""))
+        subscriber = canonical_router_subscriber(peer_id, internal_ip)
+        name = subscriber["name"]
+        internal_port = int(request.form.get("internal_port", "0") or 0)
+        if internal_port < 1 or internal_port > 65535:
+            raise RuntimeError("البورت الداخلي غير صحيح")
+
+        protocol = validate_forward_protocol(request.form.get("protocol", "tcp"))
+        requested = request.form.get("external_port", "").strip()
+        external_port = (
+            validate_forward_external_port(int(requested))
+            if requested else next_forward_external_port()
+        )
+        if not name:
+            name = "%s:%s" % (internal_ip, internal_port)
+
+        stamp = datetime.now().isoformat(timespec="seconds")
+        con = db()
+        con.execute(
+            """
+            INSERT INTO port_forwards
+            (peer_id,name,internal_ip,internal_port,external_port,protocol,
+             enabled,created_at,updated_at,last_applied_at,last_error,
+             auto_managed,last_seen_at)
+            VALUES(?,?,?,?,?,?,1,?,?,?,?,0,?)
+            """,
+            (
+                peer_id, name, internal_ip, internal_port, external_port,
+                protocol, stamp, stamp, "", "", stamp
+            )
+        )
+        forward_id = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+        con.commit()
+        con.close()
+
+        _sync_forward_changes([peer_id])
+        flash(
+            "تم إنشاء التحويل: %s:%s ← %s:%s"
+            % (
+                get_settings()["endpoint"], external_port,
+                internal_ip, internal_port
+            ),
+            "success"
+        )
+    except Exception as exc:
+        if forward_id:
+            mark_forward_error(forward_id, exc)
+            try:
+                regenerate_nat_rules()
+            except Exception:
+                pass
+            flash(
+                "تم حفظ التحويل، لكن فشل تطبيقه على MikroTik: %s" % exc,
+                "danger"
+            )
+        else:
+            flash("تعذر إنشاء التحويل: %s" % exc, "danger")
+    return redirect(url_for("port_forwards_page"))
+
+
+@app.route("/port-forwards/<int:forward_id>/edit", methods=["GET", "POST"])
+@login_required
+def port_forward_edit(forward_id):
+    item = get_forward_or_404(forward_id)
+    if not item:
+        return "Not found", 404
+
+    if request.method == "POST":
+        old_peer_id = int(item["peer_id"])
+        try:
+            peer_id = int(request.form.get("peer_id", "0") or 0)
+            if not get_peer_or_404(peer_id):
+                raise RuntimeError("الوكيل غير موجود")
+
+            internal_ip = normalize_internal_ip(request.form.get("internal_ip", ""))
+            subscriber = canonical_router_subscriber(peer_id, internal_ip)
+            name = subscriber["name"]
+            internal_port = int(request.form.get("internal_port", "0") or 0)
+            if internal_port < 1 or internal_port > 65535:
+                raise RuntimeError("البورت الداخلي غير صحيح")
+            protocol = validate_forward_protocol(request.form.get("protocol", "tcp"))
+            external_port = validate_forward_external_port(
+                request.form.get("external_port", "0"),
+                forward_id
+            )
+            enabled = 1 if request.form.get("enabled") else 0
+            stamp = datetime.now().isoformat(timespec="seconds")
+
+            con = db()
+            con.execute(
+                """
+                UPDATE port_forwards SET
+                    peer_id=?, name=?, internal_ip=?, internal_port=?,
+                    external_port=?, protocol=?, enabled=?, updated_at=?,
+                    last_error=''
+                WHERE id=?
+                """,
+                (
+                    peer_id, name or ("%s:%s" % (internal_ip, internal_port)),
+                    internal_ip, internal_port, external_port, protocol,
+                    enabled, stamp, forward_id
+                )
+            )
+            con.commit()
+            con.close()
+
+            _sync_forward_changes([old_peer_id, peer_id])
+            flash("تم تعديل التحويل وتطبيقه على Ubuntu وMikroTik", "success")
+            return redirect(url_for("port_forwards_page"))
+        except Exception as exc:
+            mark_forward_error(forward_id, exc)
+            flash("فشل تطبيق التعديل: %s" % exc, "danger")
+            item = get_forward_or_404(forward_id)
+
+    con = db()
+    peers = con.execute(
+        "SELECT id,name,tunnel_ip,enabled FROM peers ORDER BY name"
+    ).fetchall()
+    con.close()
+    return render_template(
+        "edit_forward.html",
+        item=item,
+        peers=peers,
+        settings=get_settings(),
+    )
+
+
+@app.route("/port-forwards/<int:forward_id>/apply", methods=["POST"])
+@login_required
+def port_forward_apply(forward_id):
+    item = get_forward_or_404(forward_id)
+    if not item:
+        return "Not found", 404
+    try:
+        _sync_forward_changes([item["peer_id"]])
+        flash("تم تطبيق التحويل على Ubuntu وMikroTik", "success")
+    except Exception as exc:
+        mark_forward_error(forward_id, exc)
+        flash("فشل تطبيق التحويل: %s" % exc, "danger")
+    return redirect(url_for("port_forwards_page"))
+
+
+@app.route("/port-forwards/apply-all", methods=["POST"])
+@login_required
+def port_forward_apply_all():
+    con = db()
+    peer_ids = [
+        row["peer_id"]
+        for row in con.execute(
+            "SELECT DISTINCT peer_id FROM port_forwards"
+        ).fetchall()
+    ]
+    con.close()
+    try:
+        _sync_forward_changes(peer_ids)
+        flash("تمت مزامنة جميع التحويلات", "success")
+    except Exception as exc:
+        flash("اكتملت مزامنة Ubuntu، لكن بعض الراوترات فشلت: %s" % exc, "danger")
+    return redirect(url_for("port_forwards_page"))
+
+
+@app.route("/port-forwards/<int:forward_id>/toggle", methods=["POST"])
+@login_required
+def port_forward_toggle(forward_id):
+    item = get_forward_or_404(forward_id)
+    if not item:
+        return "Not found", 404
+
+    con = db()
+    con.execute(
+        """
+        UPDATE port_forwards
+        SET enabled=CASE WHEN enabled=1 THEN 0 ELSE 1 END,
+            updated_at=?, last_error=''
+        WHERE id=?
+        """,
+        (datetime.now().isoformat(timespec="seconds"), forward_id)
+    )
+    con.commit()
+    con.close()
+
+    try:
+        _sync_forward_changes([item["peer_id"]])
+        flash("تم تغيير حالة التحويل", "success")
+    except Exception as exc:
+        mark_forward_error(forward_id, exc)
+        flash("تغيّرت الحالة، لكن فشل تطبيقها على الراوتر: %s" % exc, "danger")
+    return redirect(url_for("port_forwards_page"))
+
+
+@app.route("/port-forwards/<int:forward_id>/delete", methods=["POST"])
+@login_required
+def port_forward_delete(forward_id):
+    item = get_forward_or_404(forward_id)
+    if not item:
+        return "Not found", 404
+    peer_id = int(item["peer_id"])
+
+    con = db()
+    con.execute("DELETE FROM port_forwards WHERE id=?", (forward_id,))
+    con.commit()
+    con.close()
+
+    try:
+        _sync_forward_changes([peer_id])
+        flash("تم حذف التحويل من Ubuntu وMikroTik", "success")
+    except Exception as exc:
+        flash(
+            "حُذف من البنل وUbuntu، لكن تعذر تنظيف الراوتر: %s" % exc,
+            "danger"
+        )
+    return redirect(url_for("port_forwards_page"))
+
+
+
+@app.route("/peers/<int:peer_id>/toggle", methods=["POST"])
+@login_required
+def toggle_peer(peer_id):
+    con = db()
+    peer = con.execute("SELECT enabled FROM peers WHERE id=?", (peer_id,)).fetchone()
+    if peer:
+        con.execute("UPDATE peers SET enabled=? WHERE id=?", (0 if peer["enabled"] else 1, peer_id))
+        con.commit()
+    con.close()
+    apply_wireguard()
+    flash("تم تغيير حالة الوكيل وتحديث الربط تلقائياً", "success")
+    return redirect(url_for("wireguard_page"))
+
+
+@app.route("/peers/<int:peer_id>/delete", methods=["POST"])
+@login_required
+def delete_peer(peer_id):
+    con = db()
+    con.execute("DELETE FROM port_forwards WHERE peer_id=?", (peer_id,))
+    con.execute("DELETE FROM peers WHERE id=?", (peer_id,))
+    con.commit()
+    con.close()
+    apply_wireguard()
+    flash("تم حذف الوكيل وإزالة Peer وNAT تلقائياً", "success")
+    return redirect(url_for("wireguard_page"))
+
+
+@app.route("/peers/<int:peer_id>/config")
+@login_required
+def download_config(peer_id):
+    return redirect(url_for("wireguard_page"))
+
+
+@app.route("/peers/<int:peer_id>/qr")
+@login_required
+def peer_qr(peer_id):
+    return redirect(url_for("wireguard_page"))
+
+
+@app.route("/peers/<int:peer_id>/mikrotik")
+@login_required
+def download_mikrotik(peer_id):
+    return redirect(url_for("wireguard_page"))
+
+
+@app.route("/peers/<int:peer_id>/ping")
+@login_required
+def peer_ping(peer_id):
+    peer = get_peer_or_404(peer_id)
+    if not peer:
+        return "Not found", 404
+    result = ping_peer(peer["tunnel_ip"])
+    return render_template("ping.html", peer=peer, result=result, settings=get_settings())
+
+
+@app.route("/account/password", methods=["POST"])
+@login_required
+def change_password():
+    current = request.form.get("current_password", "")
+    new = request.form.get("new_password", "")
+    if len(new) < 8:
+        flash("كلمة المرور الجديدة يجب أن تكون 8 أحرف على الأقل", "danger")
+        return redirect(url_for("dashboard"))
+    con = db()
+    user = con.execute("SELECT * FROM users WHERE id=?", (session["user_id"],)).fetchone()
+    if not user or not check_password_hash(user["password_hash"], current):
+        con.close()
+        flash("كلمة المرور الحالية غير صحيحة", "danger")
+        return redirect(url_for("dashboard"))
+    con.execute("UPDATE users SET password_hash=? WHERE id=?", (
+        generate_password_hash(new), session["user_id"]
+    ))
+    con.commit()
+    con.close()
+    flash("تم تغيير كلمة المرور", "success")
+    return redirect(url_for("dashboard"))
+
+
+if __name__ == "__main__":
+    init_db()
+
+    subscriber_thread = threading.Thread(
+        target=subscriber_sync_loop,
+        name="subscriber-live-sync",
+        daemon=True,
+    )
+    subscriber_thread.start()
+
+    wireguard_thread = threading.Thread(
+        target=wireguard_auto_sync_loop,
+        name="wireguard-auto-sync",
+        daemon=True,
+    )
+    wireguard_thread.start()
+
+    app.run(host="0.0.0.0", port=1994)

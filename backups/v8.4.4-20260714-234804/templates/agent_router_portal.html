@@ -1,0 +1,132 @@
+{% extends "agent_base.html" %}
+{% set heading = peer.name %}
+{% set subheading = "الراوتر واليوزرات بترتيب عمودي" %}
+{% block content %}
+<section id="portalRouterSummary" class="panel portal-router-summary {{ 'portal-online' if peer_stats.online else 'portal-offline' }}">
+  <div class="portal-summary-main"><div class="portal-router-symbol">◈</div><div><h2>{{ peer.name }}</h2><p dir="ltr">{{ peer.tunnel_ip }}</p></div></div>
+  <div class="portal-summary-state">
+    {% if agent_account.can_view_router_status %}<span id="portalRouterStatus" class="status {{ 'on' if peer_stats.online else 'off' }}">{{ 'متصل' if peer_stats.online else 'أوفلاين' }}</span>{% endif %}
+    {% if agent_account.can_view_handshake %}<small>آخر اتصال: <b id="portalHandshake">{{ peer_stats.handshake_text }}</b></small>{% endif %}
+    {% if agent_account.can_view_ping %}<small>Ping: <b id="portalLatency">{{ peer_ping.latency }}</b> — Loss: <b id="portalLoss">{{ peer_ping.loss }}</b></small>{% endif %}
+  </div>
+</section>
+
+{% if agent_account.can_view_notes or (agent_account.can_edit_notes and not agent_account.read_only) %}
+<section class="panel">
+  <div class="panel-head"><div><h2>ملاحظات الراوتر</h2><p>ملاحظات خاصة بهذا الراوتر.</p></div></div>
+  {% if agent_account.can_edit_notes and not agent_account.read_only %}<form method="post" action="{{ url_for('agent_router_notes', peer_id=peer.id) }}"><textarea name="notes" rows="3" placeholder="اكتب ملاحظة...">{{ peer.notes or '' }}</textarea><button class="btn primary">حفظ الملاحظة</button></form>{% else %}<div class="router-note-preview">{{ peer.notes or 'لا توجد ملاحظات' }}</div>{% endif %}
+</section>
+{% endif %}
+
+{% if agent_account.can_view_winbox %}
+<section class="panel">
+  <div class="panel-head"><div><h2>WinBox</h2><p>عنوان الدخول المسموح لهذا الراوتر.</p></div></div>
+  <div class="agent-access-destinations vertical-access-list">
+    <div><span>داخل WireGuard</span><div class="copy-value-row"><b dir="ltr">{{ agent_server_ip }}:{{ peer.winbox_external }}</b>{% if agent_account.can_copy_winbox %}<button type="button" class="copy-inline-btn" data-copy-value="{{ agent_server_ip }}:{{ peer.winbox_external }}">نسخ</button>{% endif %}</div></div>
+    <div><span>من الإنترنت</span><div class="copy-value-row"><b dir="ltr">{{ settings.endpoint }}:{{ peer.winbox_external }}</b>{% if agent_account.can_copy_winbox %}<button type="button" class="copy-inline-btn" data-copy-value="{{ settings.endpoint }}:{{ peer.winbox_external }}">نسخ</button>{% endif %}</div></div>
+  </div>
+</section>
+{% endif %}
+
+{% if agent_account.can_open_webfig %}
+<section class="panel webfig-gateway-card">
+  <div class="panel-head">
+    <div>
+      <h2>WebFig Gateway — Transparent</h2>
+      <p>يفتح WebFig الحقيقي عن طريق IP النفق، بدون كشف اسم المستخدم أو كلمة المرور.</p>
+    </div>
+    <span class="webfig-port-badge">HTTP :80</span>
+  </div>
+
+  <div class="webfig-gateway-info">
+    <div>
+      <span>مسار الاتصال</span>
+      <b>البنل ← WireGuard ← {{ peer.name }}</b>
+    </div>
+    <div>
+      <span>حماية الخدمة</span>
+      <b>مسموحة فقط من IP سيرفر WireGuard</b>
+    </div>
+  </div>
+
+  <div class="webfig-actions-grid">
+    <a class="btn primary wide" target="_blank" rel="noopener" href="{{ url_for('agent_webfig_transparent', peer_id=peer.id) }}">
+      فتح WebFig
+    </a>
+    <a class="btn blue" target="_blank" rel="noopener" href="{{ url_for('agent_webfig_transparent', peer_id=peer.id) }}">
+      Interfaces
+    </a>
+    <a class="btn blue" target="_blank" rel="noopener" href="{{ url_for('agent_webfig_transparent', peer_id=peer.id) }}">
+      PPP
+    </a>
+    <a class="btn blue" target="_blank" rel="noopener" href="{{ url_for('agent_webfig_transparent', peer_id=peer.id) }}">
+      Firewall
+    </a>
+    <a class="btn blue" target="_blank" rel="noopener" href="{{ url_for('agent_webfig_transparent', peer_id=peer.id) }}">
+      Files
+    </a>
+    <form method="post" action="{{ url_for('agent_webfig_disconnect', peer_id=peer.id) }}">
+      <button class="btn warning wide">إنهاء جلسة WebFig</button>
+    </form>
+  </div>
+</section>
+{% endif %}
+
+{% if agent_account.can_view_vpn_access %}
+<div class="agent-device-list">
+{% for device in devices %}
+  <section class="panel agent-device-card vertical-device-card">
+    <div class="panel-head"><div><h2>{{ 'WireGuard الموبايل' if device.device_type=='mobile' else 'WireGuard Windows' }}</h2><p dir="ltr">{{ device.tunnel_ip }}</p></div><span class="status {{ 'on' if device.wg.online else 'off' }}">{{ 'متصل' if device.wg.online else 'غير متصل' }}</span></div>
+    {% if device.device_type=='mobile' %}
+      {% if agent_account.can_view_mobile_qr %}<div class="agent-qr-wrap"><img loading="lazy" src="{{ url_for('agent_portal_qr', peer_id=peer.id, device_type='mobile') }}" alt="QR"></div>{% endif %}
+      {% if agent_account.can_download_mobile_config %}<a class="btn success wide" href="{{ url_for('agent_portal_download_config', peer_id=peer.id, device_type='mobile') }}">تحميل كونفك الموبايل</a>{% endif %}
+    {% else %}
+      <div class="windows-config-box"><span class="windows-logo-mark">W</span><div><b>ملف WireGuard لـWindows</b><small>Import tunnel(s) from file</small></div></div>
+      {% if agent_account.can_download_windows_config %}<a class="btn primary wide" href="{{ url_for('agent_portal_download_config', peer_id=peer.id, device_type='windows') }}">تحميل كونفك Windows</a>{% endif %}
+    {% endif %}
+  </section>
+{% else %}<section class="panel"><div class="empty">جاري تهيئة ملفات WireGuard بالخلفية، أعد فتح الصفحة بعد ثوانٍ.</div></section>{% endfor %}
+</div>
+{% endif %}
+
+{% if agent_account.can_add_subscriber and not agent_account.read_only %}
+<details class="panel collapsible-panel"><summary><span><b>إضافة IP دخول يدوي</b><small>يضاف فقط إلى هذا الراوتر ويُربط بحسابك.</small></span><span class="summary-plus">＋</span></summary><form method="post" action="{{ url_for('agent_subscriber_add', peer_id=peer.id) }}" class="collapsible-body"><div class="form-grid"><div><label>الاسم</label><input name="name" placeholder="مثلاً: ONU 1"></div><div><label>IP الداخلي</label><input name="internal_ip" dir="ltr" placeholder="10.172.1.220" required></div><div><label>البورت</label><input type="number" name="internal_port" value="80" min="1" max="65535"></div><div><label>البروتوكول</label><select name="protocol"><option value="tcp">TCP</option><option value="udp">UDP</option><option value="both">TCP + UDP</option></select></div></div><button class="btn agent-access wide">إضافة وتطبيق</button></form></details>
+{% endif %}
+
+{% if agent_account.can_view_subscribers %}
+<section class="panel">
+  <div class="panel-head"><div><h2>اليوزرات</h2><p>تُجلب عند فتح الراوتر فقط، وتظهر عمودياً بدون تجميد الصفحة.</p></div><span id="subscriberCount" class="count-badge">{{ subscriber_total }}</span></div>
+  <div class="subscriber-toolbar">
+    <input id="subscriberSearch" type="search" placeholder="بحث بالاسم أو IP...">
+    <div class="action-row">
+      {% if agent_account.can_sync_subscribers and not agent_account.read_only %}<button id="subscriberSyncButton" class="btn blue" type="button">مزامنة بالخلفية</button>{% endif %}
+      {% if agent_account.can_export_subscribers %}<a class="btn success" href="{{ url_for('agent_router_export', peer_id=peer.id) }}">تنزيل CSV</a>{% endif %}
+    </div>
+  </div>
+  <div id="subscriberLoading" class="portal-loading"><span></span><b>جاري تحميل اليوزرات...</b></div>
+  <div id="subscriberList" class="portal-subscriber-list vertical-subscriber-list"></div>
+  <div id="subscriberPagination" class="subscriber-pagination"></div>
+</section>
+{% endif %}
+<div id="copy-toast" class="copy-toast">تم النسخ</div>
+<script>
+(function(){
+  const toast=document.getElementById('copy-toast');
+  function bindCards(){
+    document.querySelectorAll('[data-copy-value]').forEach(function(button){if(button.dataset.bound)return;button.dataset.bound='1';button.addEventListener('click',async function(){const value=button.dataset.copyValue;try{if(navigator.clipboard&&window.isSecureContext){await navigator.clipboard.writeText(value)}else{const area=document.createElement('textarea');area.value=value;area.style.position='fixed';area.style.opacity='0';document.body.appendChild(area);area.select();document.execCommand('copy');area.remove()}toast.textContent='تم النسخ: '+value}catch(error){toast.textContent='تعذر النسخ'}toast.classList.add('show');setTimeout(function(){toast.classList.remove('show')},1600)})});
+    document.querySelectorAll('.edit-subscriber-button').forEach(function(button){if(button.dataset.bound)return;button.dataset.bound='1';button.addEventListener('click',function(){const form=document.getElementById('edit-'+button.dataset.editId);if(form)form.classList.toggle('hidden')})});
+  }
+  bindCards();
+  const statusEndpoint={{ url_for('agent_router_status_api', peer_id=peer.id)|tojson }};
+  async function refreshStatus(){try{const response=await fetch(statusEndpoint,{cache:'no-store'});if(!response.ok)return;const data=await response.json();const status=document.getElementById('portalRouterStatus'),summary=document.getElementById('portalRouterSummary');if(status&&data.online!==null){status.classList.toggle('on',data.online);status.classList.toggle('off',!data.online);status.textContent=data.online?'متصل':'أوفلاين';summary.classList.toggle('portal-online',data.online);summary.classList.toggle('portal-offline',!data.online)}[['portalHandshake','handshake'],['portalLatency','latency'],['portalLoss','loss']].forEach(function(pair){const node=document.getElementById(pair[0]);if(node&&data[pair[1]])node.textContent=data[pair[1]]})}catch(error){}}
+  setInterval(refreshStatus,20000);
+  {% if agent_account.can_view_subscribers %}
+  const list=document.getElementById('subscriberList'),loading=document.getElementById('subscriberLoading'),pagination=document.getElementById('subscriberPagination'),search=document.getElementById('subscriberSearch');
+  const base={{ url_for('agent_subscribers_api', peer_id=peer.id)|tojson }};let page=1,timer=null;
+  async function loadSubscribers(targetPage){page=targetPage||1;loading.classList.remove('hidden');try{const response=await fetch(base+'?page='+page+'&q='+encodeURIComponent(search.value.trim()),{cache:'no-store'});if(!response.ok)throw new Error('load');const data=await response.json();list.innerHTML=data.html;document.getElementById('subscriberCount').textContent=data.total;pagination.innerHTML='';if(data.pages>1){for(let i=1;i<=data.pages;i++){const button=document.createElement('button');button.type='button';button.className='page-button'+(i===data.page?' active':'');button.textContent=i;button.addEventListener('click',function(){loadSubscribers(i)});pagination.appendChild(button)}}bindCards()}catch(error){list.innerHTML='<div class="empty">تعذر تحميل اليوزرات، حاول مرة ثانية.</div>'}finally{loading.classList.add('hidden')}}
+  search.addEventListener('input',function(){clearTimeout(timer);timer=setTimeout(function(){loadSubscribers(1)},350)});loadSubscribers(1);
+  const sync=document.getElementById('subscriberSyncButton');if(sync){sync.addEventListener('click',async function(){sync.disabled=true;sync.textContent='المزامنة تعمل بالخلفية...';try{await fetch({{ url_for('agent_router_sync', peer_id=peer.id)|tojson }},{method:'POST',headers:{'X-Requested-With':'fetch'}});setTimeout(function(){loadSubscribers(1)},5000)}catch(error){}setTimeout(function(){sync.disabled=false;sync.textContent='مزامنة بالخلفية'},8000)})}
+  {% endif %}
+})();
+</script>
+{% endblock %}

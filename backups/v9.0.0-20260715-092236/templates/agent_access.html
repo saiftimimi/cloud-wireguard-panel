@@ -1,0 +1,171 @@
+{% extends "base.html" %}
+{% set heading = "دخول الوكيل عبر WireGuard" %}
+{% set subheading = peer.name ~ " — موبايل وWindows بصلاحية الراوتر مالته فقط" %}
+{% block content %}
+
+{% if access_error %}
+<div class="alert danger">{{ access_error }}</div>
+{% endif %}
+
+<section class="panel agent-access-summary">
+  <div class="panel-head">
+    <div>
+      <h2>{{ peer.name }}</h2>
+      <p>
+        شبكة الدخول:
+        <span dir="ltr">{{ settings.agent_address }}</span>
+        — منفذ WireGuard:
+        <span dir="ltr">{{ settings.endpoint }}:{{ settings.agent_port }}</span>
+      </p>
+    </div>
+
+    <a class="btn" href="{{ url_for('routers_page') }}">رجوع للراوترات</a>
+  </div>
+
+  <div class="agent-access-destinations">
+    <div>
+      <span>WinBox داخل WireGuard</span>
+      <div class="copy-value-row">
+        <b dir="ltr">{{ agent_server_ip }}:{{ peer.winbox_external }}</b>
+        <button
+          type="button"
+          class="copy-inline-btn"
+          data-copy-value="{{ agent_server_ip }}:{{ peer.winbox_external }}"
+        >نسخ</button>
+      </div>
+      <small>
+        بعد تشغيل WireGuard استخدم هذا العنوان بدل البابلك
+      </small>
+    </div>
+
+    <div>
+      <span>WinBox من الإنترنت</span>
+      <div class="copy-value-row">
+        <b dir="ltr">{{ settings.endpoint }}:{{ peer.winbox_external }}</b>
+        <button
+          type="button"
+          class="copy-inline-btn"
+          data-copy-value="{{ settings.endpoint }}:{{ peer.winbox_external }}"
+        >نسخ</button>
+      </div>
+      <small>العنوان الخارجي الحالي للراوتر</small>
+    </div>
+  </div>
+</section>
+
+<div class="agent-device-grid">
+{% for device in devices %}
+  <section class="panel agent-device-card">
+    <div class="panel-head">
+      <div>
+        <h2>
+          {{ 'باركود الموبايل' if device.device_type == 'mobile' else 'كونفك Windows' }}
+        </h2>
+        <p>
+          IP الجهاز:
+          <span dir="ltr">{{ device.tunnel_ip }}</span>
+        </p>
+      </div>
+
+      <span class="status {{ 'on' if device.wg.online else 'off' }}">
+        {{ 'متصل' if device.wg.online else 'غير متصل' }}
+      </span>
+    </div>
+
+    {% if device.device_type == 'mobile' %}
+      <div class="agent-qr-wrap">
+        <img
+          src="{{ url_for('agent_access_qr', peer_id=peer.id, device_type='mobile') }}"
+          alt="WireGuard QR"
+        >
+      </div>
+      <p class="agent-device-help">
+        افتح تطبيق WireGuard بالموبايل، اختار إضافة نفق من QR، وامسح الباركود.
+      </p>
+      <a
+        class="btn success wide"
+        href="{{ url_for('download_agent_config', peer_id=peer.id, device_type='mobile') }}"
+      >
+        تحميل كونفك الموبايل
+      </a>
+    {% else %}
+      <div class="windows-config-box">
+        <span class="windows-logo-mark">W</span>
+        <div>
+          <b>ملف WireGuard جاهز لـWindows</b>
+          <small>
+            استورده من Import tunnel(s) from file
+          </small>
+        </div>
+      </div>
+      <a
+        class="btn primary wide"
+        href="{{ url_for('download_agent_config', peer_id=peer.id, device_type='windows') }}"
+      >
+        تحميل كونفك Windows
+      </a>
+    {% endif %}
+
+    <div class="agent-device-meta">
+      <span>آخر Handshake</span>
+      <b>{{ device.wg.handshake_text }}</b>
+    </div>
+  </section>
+{% else %}
+  <section class="panel">
+    <div class="empty">تعذر إنشاء أجهزة دخول الوكيل</div>
+  </section>
+{% endfor %}
+</div>
+
+<section class="panel agent-security-note">
+  <h2>العزل</h2>
+  <p>
+    الكونفك يرسل شبكات المشتركين إلى نفق الوكلاء، ثم يختار
+    Ubuntu نفق الراوتر حسب IP جهاز الوكيل. حتى إذا تكرر نفس IP
+    خلف راوترين، كل وكيل يذهب إلى الراوتر الخاص به فقط.
+  </p>
+</section>
+
+<div id="copy-toast" class="copy-toast">تم النسخ</div>
+
+<script>
+(function () {
+  const toast = document.getElementById("copy-toast");
+  let timer = null;
+
+  async function copyValue(value) {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(value);
+      return;
+    }
+    const area = document.createElement("textarea");
+    area.value = value;
+    area.style.position = "fixed";
+    area.style.opacity = "0";
+    document.body.appendChild(area);
+    area.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(area);
+    if (!ok) throw new Error("copy failed");
+  }
+
+  document.querySelectorAll("[data-copy-value]").forEach(function (button) {
+    button.addEventListener("click", async function () {
+      const value = button.getAttribute("data-copy-value");
+      try {
+        await copyValue(value);
+        toast.textContent = "تم نسخ: " + value;
+      } catch (error) {
+        toast.textContent = "تعذر النسخ";
+      }
+      toast.classList.add("show");
+      clearTimeout(timer);
+      timer = setTimeout(function () {
+        toast.classList.remove("show");
+      }, 1700);
+    });
+  });
+})();
+</script>
+{% endblock %}

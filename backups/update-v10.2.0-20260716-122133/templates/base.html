@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="{{ ui_language }}" dir="{{ ui_direction }}" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#050b18">
+  <title>{{ title or settings.system_name or "Cloud WG Panel" }}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
+</head>
+<body>
+{% set portal_agent = agent_account is not none %}
+<div class="mobile-overlay" id="mobileOverlay"></div>
+<div class="shell">
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-mobile-head">
+      <span>القائمة</span>
+      <button type="button" class="sidebar-close" id="sidebarClose" aria-label="إغلاق">×</button>
+    </div>
+
+    <div class="brand">
+      <img src="{{ url_for('static', filename='images/logo.png') }}" alt="logo">
+      <div><strong>{{ settings.system_name }}</strong><small>WireGuard Manager</small></div>
+    </div>
+
+    <nav class="sidebar-nav organized-nav">
+      <div class="nav-section-label">الرئيسية</div>
+      <a class="{{ 'active' if request.endpoint in (['agent_dashboard'] if portal_agent else ['dashboard']) else '' }}" href="{{ url_for('agent_dashboard' if portal_agent else 'dashboard') }}">
+        <span>⌂</span><b>لوحة التحكم</b>
+      </a>
+
+      <div class="nav-section-label">الشبكة</div>
+      {% if not portal_agent or agent_account.can_view_routers %}
+      <a class="{{ 'active' if request.endpoint in (['agent_routers_page','agent_router_page','agent_router_subscribers_page','agent_webfig_transparent'] if portal_agent else ['routers_page','edit_peer','peer_ping','peer_agent_access','peer_scripts','router_manage']) else '' }}" href="{{ url_for('agent_routers_page' if portal_agent else 'routers_page') }}">
+        <span>▣</span><b>الراوترات</b>
+      </a>
+      {% endif %}
+      {% if not portal_agent %}
+      <a class="{{ 'active' if request.endpoint in ['wireguard_page','sync_ubuntu_peers','apply','save_settings','wireguard_server_log'] else '' }}" href="{{ url_for('wireguard_page') }}">
+        <span>◈</span><b>WireGuard</b>
+      </a>
+      {% endif %}
+      {% if not portal_agent or agent_account.can_view_subscribers %}
+      <a class="{{ 'active' if request.endpoint in (['agent_subscribers_page','agent_router_subscribers_page'] if portal_agent else ['subscribers_page','router_subscribers_page','router_subscribers_sync']) else '' }}" href="{{ url_for('agent_subscribers_page' if portal_agent else 'subscribers_page') }}">
+        <span>♧</span><b>المشتركون</b>
+      </a>
+      {% endif %}
+
+      <div class="nav-section-label">إدارة الوصول</div>
+      <a class="{{ 'active' if request.endpoint in (['agent_profile_page'] if portal_agent else ['agent_accounts_page','agent_account_add','agent_account_edit']) else '' }}" href="{{ url_for('agent_profile_page' if portal_agent else 'agent_accounts_page') }}">
+        <span>♙</span><b>الوكلاء</b>
+      </a>
+      <a class="{{ 'active' if request.endpoint in (['agent_permissions_overview','agent_permissions_detail'] if portal_agent else ['permissions_page','permission_edit']) else '' }}" href="{{ url_for('agent_permissions_overview' if portal_agent else 'permissions_page') }}">
+        <span>◆</span><b>الصلاحيات</b>
+      </a>
+
+      <div class="nav-section-label">النظام</div>
+      {% if not portal_agent %}
+      <a class="{{ 'active' if request.endpoint=='health_center_page' else '' }}" href="{{ url_for('health_center_page') }}"><span>♥</span><b>مركز الصحة</b></a>
+      <a class="{{ 'active' if request.endpoint=='audit_log_page' else '' }}" href="{{ url_for('audit_log_page') }}"><span>≡</span><b>سجل العمليات</b></a>
+      <a class="{{ 'active' if request.endpoint=='maintenance_page' else '' }}" href="{{ url_for('maintenance_page') }}"><span>⚙</span><b>وضع الصيانة</b></a>
+      <a class="{{ 'active' if request.endpoint=='system_updates_page' else '' }}" href="{{ url_for('system_updates_page') }}"><span>⇪</span><b>التحديثات</b></a>
+      <a class="{{ 'active' if request.endpoint=='translations_manager' else '' }}" href="{{ url_for('translations_manager') }}">
+        <span>文</span><b>اللغات والترجمات</b>
+      </a>
+      {% endif %}
+      <a class="nav-logout" href="{{ url_for('agent_logout' if portal_agent else 'logout') }}">
+        <span>↪</span><b>تسجيل الخروج</b>
+      </a>
+    </nav>
+
+    <a class="sidebar-user sidebar-profile-link {{ 'active' if request.endpoint=='profile_page' else '' }}" href="{{ url_for('profile_page') }}">
+      {% if portal_agent %}
+      <div class="avatar">{{ (agent_account.display_name or agent_account.username)[0]|upper }}</div>
+      <div><b>{{ agent_account.display_name or agent_account.username }}</b><small>الملف الشخصي</small></div>
+      {% else %}
+      <div class="avatar">{{ session.get('display_name', session.get('username','A'))[0]|upper }}</div>
+      <div><b>{{ session.get('display_name', session.get('username','admin')) }}</b><small>الملف الشخصي</small></div>
+      {% endif %}
+    </a>
+    <div class="version">Cloud WG Panel v{{ cloud_version }}</div>
+  </aside>
+
+  <main class="content">
+    {% if not portal_agent and settings.get('maintenance_mode') == '1' %}<div class="maintenance-banner">وضع الصيانة مفعّل — دخول الوكلاء متوقف مؤقتاً</div>{% endif %}
+    <header class="topbar">
+      <button type="button" class="mobile-menu-btn" id="mobileMenuButton" aria-label="فتح القائمة"><span></span><span></span><span></span></button>
+      <div class="topbar-title"><h1>{{ heading or "لوحة التحكم" }}</h1><p>{{ subheading or "إدارة شبكة WireGuard وMikroTik API" }}</p></div>
+      <div class="top-actions"><span class="live-dot"></span><span>الخادم متصل</span><small id="liveClock"></small></div>
+      <div class="ui-controls">
+        <div class="language-switcher">
+          <button type="button" class="ui-icon-button" data-ui-menu="language" aria-label="{{ t('language') }}">🌐</button>
+          <div class="ui-popover" data-ui-popover="language"><strong>{{ t('language') }}</strong>{% for code,meta in supported_languages.items() %}<button type="button" class="ui-choice {{ 'active' if ui_language==code else '' }}" data-language="{{ code }}">{{ meta.label }}</button>{% endfor %}</div>
+        </div>
+        <div class="notification-center">
+          <button type="button" class="ui-icon-button notification-button" data-ui-menu="notifications" aria-label="{{ t('notifications') }}">🔔<span class="notification-count {{ 'hidden' if notification_unread==0 else '' }}" id="notificationCount">{{ notification_unread }}</span></button>
+          <div class="ui-popover notification-popover" data-ui-popover="notifications"><div class="notification-head"><strong>{{ t('notifications') }}</strong><button type="button" id="markNotificationsRead">{{ t('mark_all_read') }}</button></div><div class="notification-list" id="notificationList">{% for item in notification_items %}<article class="notification-item {{ item.kind }} {{ 'unread' if not item.is_read else '' }}"><b>{{ item.title }}</b><p>{{ item.message }}</p><small>{{ item.created_at }}</small></article>{% else %}<div class="empty-notifications">{{ t('no_notifications') }}</div>{% endfor %}</div></div>
+        </div>
+      </div>
+    </header>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}{% for category, message in messages %}<div class="alert {{ category }}">{{ message }}</div>{% endfor %}{% endwith %}
+    <div class="page-content">{% block content %}{% endblock %}</div>
+    <footer class="app-footer"><span>© 2026 Cloud WG Panel — جميع الحقوق محفوظة</span><span>الإصدار {{ cloud_version }}</span></footer>
+  </main>
+</div>
+
+<nav class="mobile-bottom-nav" aria-label="التنقل السريع">
+  <a class="{{ 'active' if request.endpoint in (['agent_dashboard'] if portal_agent else ['dashboard']) else '' }}" href="{{ url_for('agent_dashboard' if portal_agent else 'dashboard') }}"><span>⌂</span><small>الرئيسية</small></a>
+  {% if not portal_agent or agent_account.can_view_routers %}<a class="{{ 'active' if request.endpoint in (['agent_routers_page','agent_router_page','agent_router_subscribers_page'] if portal_agent else ['routers_page','edit_peer','router_manage']) else '' }}" href="{{ url_for('agent_routers_page' if portal_agent else 'routers_page') }}"><span>▣</span><small>الراوترات</small></a>{% endif %}
+  {% if not portal_agent or agent_account.can_view_subscribers %}<a class="{{ 'active' if request.endpoint in (['agent_subscribers_page','agent_router_subscribers_page'] if portal_agent else ['subscribers_page','router_subscribers_page']) else '' }}" href="{{ url_for('agent_subscribers_page' if portal_agent else 'subscribers_page') }}"><span>♧</span><small>المشتركون</small></a>{% endif %}
+  <a class="{{ 'active' if request.endpoint in (['agent_profile_page'] if portal_agent else ['agent_accounts_page','agent_account_add','agent_account_edit']) else '' }}" href="{{ url_for('agent_profile_page' if portal_agent else 'agent_accounts_page') }}"><span>♙</span><small>الوكلاء</small></a>
+</nav>
+
+<script>
+(function(){
+  const sidebar=document.getElementById('sidebar'),overlay=document.getElementById('mobileOverlay'),openButton=document.getElementById('mobileMenuButton'),closeButton=document.getElementById('sidebarClose');
+  function setMenu(open){sidebar.classList.toggle('open',open);overlay.classList.toggle('open',open);document.body.classList.toggle('menu-open',open)}
+  openButton.addEventListener('click',()=>setMenu(true));closeButton.addEventListener('click',()=>setMenu(false));overlay.addEventListener('click',()=>setMenu(false));sidebar.querySelectorAll('nav a').forEach(link=>link.addEventListener('click',()=>setMenu(false)));document.addEventListener('keydown',event=>{if(event.key==='Escape')setMenu(false)});
+})();
+</script>
+<script>
+(function(){
+  async function savePreference(payload){try{await fetch("{{ url_for('ui_preferences') }}",{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})}catch(error){}}
+  document.querySelectorAll('[data-ui-menu]').forEach(function(button){button.addEventListener('click',function(event){event.stopPropagation();const name=button.dataset.uiMenu;document.querySelectorAll('[data-ui-popover]').forEach(function(popover){popover.classList.toggle('open',popover.dataset.uiPopover===name&&!popover.classList.contains('open'))})})});
+  document.addEventListener('click',function(){document.querySelectorAll('[data-ui-popover]').forEach(function(p){p.classList.remove('open')})});
+  document.querySelectorAll('.ui-popover').forEach(function(p){p.addEventListener('click',function(e){e.stopPropagation()})});
+  document.querySelectorAll('[data-language]').forEach(function(button){button.addEventListener('click',async function(){await savePreference({language:button.dataset.language,theme:'dark'});window.location.reload()})});
+  const markRead=document.getElementById('markNotificationsRead');if(markRead){markRead.addEventListener('click',async function(){await fetch("{{ url_for('notifications_read_all_api') }}",{method:'POST'});document.querySelectorAll('.notification-item').forEach(function(item){item.classList.remove('unread')});const count=document.getElementById('notificationCount');if(count){count.textContent='0';count.classList.add('hidden')}})}
+  async function refreshNotifications(){if(document.hidden)return;try{const response=await fetch("{{ url_for('notifications_api') }}",{cache:'no-store'});if(!response.ok)return;const data=await response.json();const count=document.getElementById('notificationCount');if(count){count.textContent=data.unread;count.classList.toggle('hidden',!data.unread)}}catch(error){}}
+  setInterval(refreshNotifications,20000);
+})();
+</script>
+<script>
+(function(){
+  const node=document.getElementById('liveClock');
+  function tick(){if(node)node.textContent=new Intl.DateTimeFormat('ar-IQ',{hour:'2-digit',minute:'2-digit',second:'2-digit'}).format(new Date())}
+  tick();setInterval(tick,1000);
+})();
+</script>
+</body>
+</html>
+
