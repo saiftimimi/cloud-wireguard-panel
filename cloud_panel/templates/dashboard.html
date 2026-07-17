@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% set heading = "لوحة التحكم" %}
+{% set subheading = "نظرة عامة مباشرة على الشبكة والنظام" %}
+{% block content %}
+<div class="hero-metrics">
+  <article class="metric-card metric-purple"><div class="metric-icon">{% include "icons/router.svg" %}</div><div><span>إجمالي الراوترات</span><strong>{{ total }}</strong><small><i></i>{{ online }} راوتر متصل</small></div></article>
+  <article class="metric-card metric-blue"><div class="metric-icon">{% include "icons/users.svg" %}</div><div><span>إجمالي المشتركين</span><strong>{{ subscriber_total }}</strong><small><i></i>مسجلون في النظام</small></div></article>
+  <article class="metric-card metric-green"><div class="metric-icon">{% include "icons/traffic.svg" %}</div><div><span>حركة الشبكة</span><strong>{{ (rx + tx)|human_bytes }}</strong><small>RX {{ rx|human_bytes }} · TX {{ tx|human_bytes }}</small></div></article>
+  <article class="metric-card metric-orange"><div class="metric-icon">{% include "icons/server.svg" %}</div><div><span>حالة النظام</span><strong class="system-grade">{{ 'ممتاز' if offline == 0 else 'يحتاج متابعة' }}</strong><small><i></i>{{ agent_total }} وكيل فعال</small></div></article>
+</div>
+
+<div class="dashboard-layout-pro">
+  <section class="panel pro-panel routers-overview">
+    <div class="panel-head"><div><h2>آخر الراوترات المضافة</h2><p>حالة الاتصال وآخر نشاط وإجراءات الوصول السريع</p></div><a class="btn" href="{{ url_for('routers_page') }}">عرض الكل</a></div>
+    <div class="pro-table-wrap"><table class="pro-table"><thead><tr><th>الراوتر</th><th>IP النفق</th><th>الحالة</th><th>آخر اتصال</th><th>الإجراءات</th></tr></thead><tbody>
+    {% for p in peers[:6] %}<tr><td><div class="router-cell"><span class="mini-router-icon">{% include "icons/router.svg" %}</span><b>{{ p.name }}</b></div></td><td dir="ltr">{{ p.tunnel_ip }}</td><td><span class="state-pill {{ 'online' if p.wg.online else 'offline' }}">{{ 'متصل' if p.wg.online else 'غير متصل' }}</span></td><td>{{ p.wg.handshake_text or '-' }}</td><td><div class="row-actions"><a href="{{ url_for('router_manage',peer_id=p.id) }}" title="فتح">◉</a><a href="{{ url_for('peer_ping',peer_id=p.id) }}" title="فحص">⌁</a>{% if p.private_key %}<a href="{{ url_for('peer_scripts',peer_id=p.id) }}" title="السكربت">⋮</a>{% endif %}</div></td></tr>
+    {% else %}<tr><td colspan="5" class="empty">لا توجد راوترات</td></tr>{% endfor %}
+    </tbody></table></div>
+  </section>
+
+  <section class="panel pro-panel services-panel">
+    <div class="panel-head"><div><h2>حالة النظام والخدمات</h2><p>فحص مختصر للخدمات الأساسية</p></div></div>
+    <div class="service-stack">{% for item in service_checks %}<div class="service-item"><span class="service-icon">{{ '✓' if item.ok else '!' }}</span><div><b>{{ item.name }}</b><small>{{ item.detail }}</small></div><strong class="{{ 'ok' if item.ok else 'down' }}">{{ 'يعمل' if item.ok else 'متوقف' }} <i></i></strong></div>{% endfor %}</div>
+  </section>
+
+  <section class="panel pro-panel activity-panel">
+    <div class="panel-head"><div><h2>آخر العمليات</h2><p>أحدث التغييرات المسجلة بالنظام</p></div><a class="btn" href="{{ url_for('audit_log_page') }}">عرض الكل</a></div>
+    <div class="activity-list">{% for item in recent_operations %}<div class="activity-item"><span class="activity-badge">{{ item.action[:1]|upper }}</span><div><b>{{ item.action }}</b><small>{{ item.target or item.principal_name or 'النظام' }}</small></div><time>{{ item.created_at or '-' }}</time></div>{% else %}<div class="empty">لا توجد عمليات حديثة</div>{% endfor %}</div>
+  </section>
+
+  <section class="panel pro-panel traffic-panel">
+    <div class="panel-head"><div><h2>استخدام الشبكة</h2><p>إجمالي حركة WireGuard الحالية</p></div><span class="period-chip">مباشر</span></div>
+    {% set total_traffic = rx + tx %}<div class="traffic-numbers"><div><span>التنزيل</span><b>{{ rx|human_bytes }}</b></div><div><span>الرفع</span><b>{{ tx|human_bytes }}</b></div></div>
+    <div class="traffic-visual"><div class="traffic-line download-line" style="--value:{{ ((rx / total_traffic) * 100)|round|int if total_traffic else 0 }}%"><span></span></div><div class="traffic-line upload-line" style="--value:{{ ((tx / total_traffic) * 100)|round|int if total_traffic else 0 }}%"><span></span></div></div>
+    <div class="traffic-legend"><span><i class="download-dot"></i>التنزيل</span><span><i class="upload-dot"></i>الرفع</span></div>
+  </section>
+</div>
+{% endblock %}

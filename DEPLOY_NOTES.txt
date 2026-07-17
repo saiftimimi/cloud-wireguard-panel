@@ -1,0 +1,8 @@
+Cloud WireGuard Panel deployment package
+
+Important:
+- Keep the existing data.db file to preserve users, routers, settings, and history.
+- Keep the existing .secret file so encrypted values and sessions remain readable.
+- Keep the existing venv unless dependencies are intentionally rebuilt.
+- Back up the old project before replacing application files.
+- The included root app.py is a compatibility launcher for cloud-wireguard.service.

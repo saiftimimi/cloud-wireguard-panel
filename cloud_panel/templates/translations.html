@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% set heading = "الإعدادات" %}
+{% set subheading = "إدارة الترجمات وإعدادات واجهة النظام" %}
+{% block content %}
+<div class="settings-layout">
+  <aside class="settings-nav panel">
+    <a class="active" href="#translations"><span>{% include "icons/translate.svg" %}</span><div><b>اللغات والترجمة</b><small>تعديل مصطلحات النظام</small></div></a>
+    <a href="{{ url_for('system_updates_page') }}"><span>{% include "icons/backup.svg" %}</span><div><b>النسخ والتحديثات</b><small>تحديث النظام ونسخه</small></div></a>
+    <a href="{{ url_for('maintenance_page') }}"><span>{% include "icons/tools.svg" %}</span><div><b>الصيانة</b><small>إعدادات وضع الصيانة</small></div></a>
+  </aside>
+  <div class="settings-content">
+    <section class="panel settings-section" id="translations">
+      <div class="panel-head"><div><h2>اللغات والترجمة</h2><p>تعديل أي مصطلح يظهر بالنظام بدون تغيير ملفات البرنامج.</p></div></div>
+      <form method="post" class="translation-form modern-translation-form">
+        <div><label>اللغة</label><select name="lang">{% for code,meta in supported_languages.items() %}<option value="{{ code }}">{{ meta.label }}</option>{% endfor %}</select></div>
+        <div><label>مفتاح النص</label><select name="key">{% for key in base_keys %}<option value="{{ key }}">{{ key }}</option>{% endfor %}</select></div>
+        <div class="full"><label>النص الجديد</label><input name="value" required placeholder="اكتب الترجمة الجديدة"></div>
+        <button class="btn primary" type="submit">حفظ الترجمة</button>
+      </form>
+    </section>
+
+    <section class="panel settings-section">
+      <div class="panel-head"><div><h2>التعديلات المحفوظة</h2><p>كل الترجمات المخصصة التي تتقدم على النصوص الافتراضية.</p></div><span class="settings-count">{{ overrides|length }}</span></div>
+      <div class="translation-list modern-translation-list">{% for item in overrides %}<article><span>{{ item.lang|upper }}</span><div><b>{{ item.key }}</b><p>{{ item.value }}</p></div></article>{% else %}<div class="empty">لا توجد تعديلات مخصصة حالياً</div>{% endfor %}</div>
+    </section>
+  </div>
+</div>
+{% endblock %}

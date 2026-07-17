@@ -1,0 +1,8 @@
+Cloud WireGuard Panel 11.6.0
+
+- Added live CPU usage for every MikroTik router.
+- Added RouterOS uptime and RAM usage to router cards.
+- Added current RX/TX bandwidth rates using cached MikroTik API counters.
+- Metrics refresh every 10 seconds in a background worker and browser API polling.
+- Uses up to 4 concurrent API workers to avoid excessive router/server load.
+- RouterOS firewall filter rules remain unmanaged; no cleanup or filter creation was added.
