@@ -2,10 +2,33 @@
 {% set heading = "لوحة التحكم" %}
 {% set subheading = "نظرة عامة مباشرة على الشبكة والنظام" %}
 {% block content %}
+<style>
+  .dashboard-refresh .hero-metrics{gap:18px!important}
+  .dashboard-refresh .metric-card{min-height:138px!important;height:auto!important;padding:22px!important;border-radius:18px!important}
+  .dashboard-refresh .metric-icon{width:54px!important;height:54px!important;min-width:54px!important;border-radius:15px!important}
+  .dashboard-refresh .metric-card span{font-size:13px!important}
+  .dashboard-refresh .metric-card strong{font-size:31px!important;margin-top:4px;display:block}
+  .dashboard-refresh .metric-card small{font-size:11px!important;margin-top:6px;display:block}
+  .dashboard-refresh .panel{border-radius:18px!important;padding:22px!important}
+  .dashboard-refresh .panel-head h2{font-size:17px!important}
+  .dashboard-refresh .panel-head p{font-size:12px!important}
+  .dashboard-refresh .pro-table thead th{font-size:11px!important;padding:13px 15px!important}
+  .dashboard-refresh .pro-table tbody td{font-size:13px!important;padding:14px 15px!important}
+  .dashboard-refresh .traffic-numbers{grid-template-columns:1fr 1fr;gap:14px}
+  .dashboard-refresh .traffic-numbers>div{padding:18px!important;border-radius:14px!important}
+  .dashboard-refresh .traffic-numbers span{font-size:12px!important}
+  .dashboard-refresh .traffic-numbers b{font-size:24px!important;display:block;margin-top:5px}
+  .dashboard-refresh .traffic-line{height:10px!important}
+  html[data-theme="dark"] .dashboard-refresh .panel,
+  html[data-theme="dark"] .dashboard-refresh .metric-card{box-shadow:0 16px 42px rgba(0,0,0,.22)}
+  @media(max-width:900px){.dashboard-refresh .hero-metrics{grid-template-columns:repeat(2,minmax(0,1fr))!important}}
+  @media(max-width:560px){.dashboard-refresh .hero-metrics{grid-template-columns:1fr!important}.dashboard-refresh .traffic-numbers{grid-template-columns:1fr}}
+</style>
+<div class="dashboard-refresh">
 <div class="hero-metrics">
   <article class="metric-card metric-purple"><div class="metric-icon">{% include "icons/router.svg" %}</div><div><span>إجمالي الراوترات</span><strong>{{ total }}</strong><small><i></i>{{ online }} راوتر متصل</small></div></article>
   <article class="metric-card metric-blue"><div class="metric-icon">{% include "icons/users.svg" %}</div><div><span>إجمالي المشتركين</span><strong>{{ subscriber_total }}</strong><small><i></i>مسجلون في النظام</small></div></article>
-  <article class="metric-card metric-green"><div class="metric-icon">{% include "icons/traffic.svg" %}</div><div><span>حركة الشبكة</span><strong>{{ (rx + tx)|human_bytes }}</strong><small>RX {{ rx|human_bytes }} · TX {{ tx|human_bytes }}</small></div></article>
+  <article class="metric-card metric-green"><div class="metric-icon">{% include "icons/traffic.svg" %}</div><div><span>حركة الشبكة</span><strong>{{ (rx + tx)|human_bytes }}</strong><small>تنزيل {{ rx|human_bytes }} · رفع {{ tx|human_bytes }}</small></div></article>
   <article class="metric-card metric-orange"><div class="metric-icon">{% include "icons/server.svg" %}</div><div><span>حالة النظام</span><strong class="system-grade">{{ 'ممتاز' if offline == 0 else 'يحتاج متابعة' }}</strong><small><i></i>{{ agent_total }} وكيل فعال</small></div></article>
 </div>
 
@@ -34,5 +57,6 @@
     <div class="traffic-visual"><div class="traffic-line download-line" style="--value:{{ ((rx / total_traffic) * 100)|round|int if total_traffic else 0 }}%"><span></span></div><div class="traffic-line upload-line" style="--value:{{ ((tx / total_traffic) * 100)|round|int if total_traffic else 0 }}%"><span></span></div></div>
     <div class="traffic-legend"><span><i class="download-dot"></i>التنزيل</span><span><i class="upload-dot"></i>الرفع</span></div>
   </section>
+</div>
 </div>
 {% endblock %}
